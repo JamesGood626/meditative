@@ -1,4 +1,5 @@
 defmodule Utils do
+
   import Cat
   def remove_last(xs) do
     len = xs |> length

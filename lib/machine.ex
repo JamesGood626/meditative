@@ -1,4 +1,5 @@
 defmodule Machine do
+
   import Cat
   alias State
   alias Transition

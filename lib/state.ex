@@ -12,6 +12,7 @@ defmodule State do
     }
   }
   """
+
   defstruct [:name, :on, :on_entry, :on_exit, :type, :initial_state, :parallel_states]
 
   def new(%{

@@ -2,6 +2,7 @@ defmodule Transition do
   @moduledoc """
   Transition will need to add support for actions in the future.
   """
+
   defstruct [:event, :from, :to, :actions, :guard]
 
   def new(%{

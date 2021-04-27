@@ -1,4 +1,5 @@
 defmodule Cat do
+
   def id(x), do: x
 
   @doc """
