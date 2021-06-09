@@ -5,13 +5,9 @@ defmodule MeditativeTest do
   alias State
   alias Transition
 
-  # def increment(context, event) do
-  #   IO.inspect(context)
-  #   # TODO (should be returning an Assign struct, but is it really necessary? Couldn't I just have the user return a map instead):
-  #   # Assign.assign(%{"count" => (context |> Map.get("count")) + 1})
-  #   count = context |> Map.get("count")
-  #   %{"count" => count + 1}
-  # end
+  # IMMEDIATE TODO:
+  # Need to support global events... (which will be executed no matter what the current state is)
+  # Reference XState
 
   setup_all do
     actions = %{
@@ -33,6 +29,14 @@ defmodule MeditativeTest do
         "count" => 0,
         "name" => nil
       },
+      # LATER TODO: Started working on this... so that this event can be triggered irregardless of what the current finite state is,
+      #             but gonna need to save this for later.
+      #             Going to require possibly writing a different implmentation of the construct_transitions function.
+      # "on" => %{
+        # "UPDATE" => %{
+        #   "actions" => ["increment", "increment", "increment"]
+        # },
+      # },
       "states" => %{
         "p" => %{
           # ["#meditative.p", "#meditative.p.region1.foo1",
@@ -155,7 +159,7 @@ defmodule MeditativeTest do
           name: "#meditative.first_step",
           on: %{
             "RUN" => %Transition{actions: nil, event: "RUN", from: "#meditative.first_step", guard: nil, to: "#meditative.first_step.nested_first_step"},
-            "UPDATE" => %Transition{actions: ["increment", "increment", "increment"], event: "UPDATE", from: "#meditative.first_step", guard: nil, to: "#meditative.first_step"}
+            "UPDATE" => %Transition{actions: ["increment", "increment", "increment"], event: "UPDATE", from: "#meditative.first_step", guard: nil, to: nil}
           },
           on_entry: nil,
           on_exit: nil,
@@ -366,7 +370,16 @@ defmodule MeditativeTest do
       }
     }
 
-  %{statechart: statechart, interpreted_statechart: interpreted_statechart, actions: actions, guards: guards}
+    %{statechart: statechart, interpreted_statechart: interpreted_statechart, actions: actions, guards: guards}
+  end
+
+  test "Machine supports events for which the transition has no target finite state, but only runs actions", %{statechart: statechart, actions: actions, guards: guards} do
+    machine =
+      Meditative.interpret(statechart, %{"actions" => actions, "guards" => guards})
+      |> Meditative.transition("GTFO")
+      |> Meditative.transition("UPDATE")
+
+    assert (machine |> Map.get(:context)) === %{"count" => 3, "name" => nil}
   end
 
   test "Machine.interpret/1 interprets a statechart by converting to a structure that supports statechart functionality.", %{statechart: statechart, interpreted_statechart: interpreted_statechart} do
@@ -416,5 +429,45 @@ defmodule MeditativeTest do
     machine = Meditative.hydrate(statechart, %{"actions" => actions, "guards" => guards}, persisted_state)
     assert machine |> Map.get(:current_state) === "#meditative.first_step"
     assert machine |> Map.get(:context) === %{"count" => 2, "name" => nil}
+  end
+
+  test "Machine which has a transition with an action and no transition target, may trigger a transition from within the action." do
+    actions = %{
+      # If the action function returns an Assign struct, then update
+      # the context with the map stored on the Assign under the :next_context key.
+      "increment_and_transition_finite_state" => fn (context, event) ->
+                      count = context |> Map.get("count")
+                      {"TRANSITION_TO_B", %{"count" => count + 1}}
+                     end
+    }
+
+    statechart = %{
+      "id" => "meditative",
+      "initial_state" => "a",
+      "context" => %{
+        "count" => 0
+      },
+      "states" => %{
+        "a" => %{
+          "on" => %{
+            "DO_IT" => %{
+              "actions" => "increment_and_transition_finite_state"
+            },
+            "TRANSITION_TO_B" => %{"target" => "b"}
+          }
+        },
+        "b" => %{
+          "type" => "final"
+        }
+      }
+    }
+
+      machine = Meditative.interpret(statechart, %{"actions" => actions, "guards" => nil})
+      state_before_transition = machine |> Map.get(:current_state)
+      updated_machine = Meditative.transition(machine, "DO_IT")
+      state_after_transition = updated_machine |> Map.get(:current_state)
+
+      assert state_before_transition === "#meditative.a"
+      assert state_after_transition === "#meditative.b"
   end
 end

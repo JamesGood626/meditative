@@ -27,3 +27,4 @@ meditative-*.tar
 /tmp
 
 .formatter.exs
+.vscode

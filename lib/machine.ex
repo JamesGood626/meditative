@@ -4,7 +4,7 @@ defmodule Machine do
   alias State
   alias Transition
 
-  defstruct [:id, :current_state, :parallel_state_key, :context, :states, :actions, :guards]
+  defstruct [:id, :current_state, :parallel_state_key, :context, :on, :states, :actions, :guards]
 
   def get_id(statechart) do
     statechart
@@ -115,7 +115,7 @@ defmodule Machine do
     "actions" => nil,
     "context" => context
   }) do
-    context
+    {nil, context}
   end
 
   def invoke_guard(%{"machine" => machine, "guard" => guard, "context" => context}) do
@@ -133,8 +133,12 @@ defmodule Machine do
     case action_func do
       nil -> raise "ERROR: No action function present for #{action} in the second argument to Machine.interpret/2"
       _ ->
-        context_updates = action_func.(context, event)
-        Map.merge(context, context_updates, fn _k, _v1, v2 -> v2 end)
+        case action_func.(context, event) do
+          {do_transition_event, context_updates} ->
+            {do_transition_event, Map.merge(context, context_updates, fn _k, _v1, v2 -> v2 end)}
+          context_updates ->
+            Map.merge(context, context_updates, fn _k, _v1, v2 -> v2 end)
+        end
     end
   end
 
@@ -154,8 +158,12 @@ defmodule Machine do
     "event" => event
   }) when is_list(actions) do
     actions
-    |> Enum.reduce(context, fn (action, acc) ->
-      invoke_action(%{"machine" => machine, "action" => action, "context" => acc, "event" => event})
+    |> Enum.reduce({nil, context}, fn (action, {transition_event, context_acc}) ->
+      # NOTE: Also had to add this case, and change the acc value from context to {transition_event, context} to support triggering transitions within actions.
+      case invoke_action(%{"machine" => machine, "action" => action, "context" => context_acc, "event" => event}) do
+        {do_transition_event, updated_context} -> {do_transition_event, updated_context}
+        updated_context -> {transition_event, updated_context}
+      end
     end)
   end
 
@@ -200,7 +208,7 @@ defmodule Machine do
     target_state = transition |> get_target_state |> get_state(states)
     case {transition, run_cond(%{"machine" => machine, "guard" => get_guard(transition), "context" => context})} do
       {%Transition{to: to, actions: actions}, true} ->
-        new_context = apply_actions(%{
+        {_, new_context} = apply_actions(%{
           "machine" => machine,
           "actions" => actions,
           "context" => context,
@@ -230,7 +238,9 @@ defmodule Machine do
     "UNEXPECTED_ERROR"
   """
   def determine_next_transition_step(%{ "transition" => nil }), do: "NO_TRANSITION"
-  def determine_next_transition_step(%{ "target_state" => nil }), do: "NO_TRANSITION"
+  # NOTE/TODO: This clause (originally %{ "target_state" => nil}) was being caught in the case where I want "RUN_ACTIONS" to be returned...
+  #            make sure this doesn't error in the cases where I want it to actually return "NO_TRANSITION"
+  def determine_next_transition_step(%{ "target_state" => nil, "transition" => %Transition{to: nil, actions: nil}}), do: "NO_TRANSITION"
   def determine_next_transition_step(%{ "cond_result" => false }), do: "NO_TRANSITION"
 
   def determine_next_transition_step(%{
@@ -248,17 +258,17 @@ defmodule Machine do
   end
 
   def determine_next_transition_step(%{
+    "transition" => %Transition{to: nil, actions: actions} = transition,
+    "cond_result" => true
+  }) do
+    {"RUN_ACTIONS", transition}
+  end
+
+  def determine_next_transition_step(%{
     "transition" => %Transition{to: to, actions: actions} = transition,
     "cond_result" => true
   }) do
     {"TRANSITION", transition}
-  end
-
-  def determine_next_transition_step(%{
-    "transition" => %Transition{actions: actions} = transition,
-    "cond_result" => true
-  }) do
-    {"RUN_ACTIONS", transition}
   end
 
   def determine_next_transition_step(x), do: {"UNEXPECTED_ERROR", x}
@@ -329,7 +339,10 @@ defmodule Machine do
   }) do
     case next_step do
       {"TRANSITION", %Transition{to: to, actions: actions}} ->
-        new_context = apply_actions(%{
+        # TODO: Had to pattern match on the tuple after adding the actions can return a tuple to trigger a transition feature...
+        #       would be better if I create a function that only retrieves a new_context back if it's a regular transition we're executing
+        #       otherwise get a tuple back if it's the actions feature.
+        {_, new_context} = apply_actions(%{
           "machine" => machine,
           "actions" => actions,
           "context" => context,
@@ -343,17 +356,42 @@ defmodule Machine do
           "machine" => machine,
           "context" => context
         })
-        %{"new_context" => new_context, "to" => to} =
+      %{"new_context" => new_context, "to" => to} =
             apply_transient_transition(%{"machine" => machine, "transition" => transient_transition, "context" => new_context, "event" => event, "states" => states, "state" => from_state, "fallback_to" => to})
         %{machine | current_state: target_state |> Cat.maybe ~>> fn x -> Map.get(x, :initial_state) end |> Cat.unwrap || to, context: new_context}
+        # TODO: Add code to enable actions (associated with a Transition that doesn't specify a target)
+        #       to trigger transitions by returning {"TRANSITION_TO_TRIGGER", payload}
+        # Would just need to invoke:
+        # transition(%Machine{current_state: current_state, states: states, context: context, guards: guards} = machine, event)
+        # ^^ In the case that the action returns the tuple to trigger a transition. <- So yeah... this would be really easy to add.
       {"RUN_ACTIONS", %Transition{actions: actions}} ->
-        new_context = apply_actions(%{
+        # NOTE: Commented lines is what was ran for "RUN_ACTIONS" before adding the ability
+        #       to trigger transitions from a event which only runs actions.
+        # new_context = apply_actions(%{
+        #   "machine" => machine,
+        #   "actions" => actions,
+        #   "context" => context,
+        #   "event" => event
+        # })
+        # %{machine | context: new_context}
+
+        # WARNING: This feature does come at a cost...
+        #          The possibility of transitioning between two different finite states
+        #          that have actions which transition to another finite state which again transitions... and
+        #          could do so infinitely many times is a possibility.
+        #          So this feature must be used with care.
+        case apply_actions(%{
           "machine" => machine,
           "actions" => actions,
           "context" => context,
           "event" => event
-        })
-        %{machine | context: new_context}
+        }) do
+          {nil, new_context} -> %{machine | context: new_context}
+          {transition_event, new_context} ->
+            updated_machine = %{machine | context: new_context}
+            # LLO/WTF
+            Machine.transition(updated_machine, transition_event)
+        end
       "NO_TRANSITION" ->
         machine
       {"UNEXPECTED_ERROR", x} ->
@@ -436,11 +474,22 @@ defmodule Machine do
       end
     else
       from_state = states |> Cat.maybe ~>> fn x -> Map.get(x, current_state) end |> Cat.unwrap
+      # global_transition = machine |> get_transition_associated_with_event(%{
+      #   "event" => event,
+      #   "machine" => machine,
+      #   "context" => context
+      # })
       transition = from_state |> get_transition_associated_with_event(%{
         "event" => event,
         "machine" => machine,
         "context" => context
       })
+
+      # TESTING/TODO
+      # if global_transition !== nil && transition !== nil do
+      #   raise "DEVELOPER ERROR: You may not have transitions with the same name on the global 'on' transitions map and in \
+      #          a specific finite state's 'on' transition map. event: #{event} current_state: #{current_state}"
+      # end
 
       target_state = transition |> get_target_state |> get_state(states)
       next_step = determine_next_transition_step(%{
@@ -472,6 +521,7 @@ defmodule Machine do
     "id" => id,
     "current_state" => current_state,
     "context" => context,
+    # "on" => on,
     "states" => states,
     "actions" => actions,
     "guards" => guards
@@ -481,6 +531,7 @@ defmodule Machine do
       current_state: current_state,
       parallel_state_key: rest |> Map.get("parallel_state_key"),
       context: context,
+      # on: on,
       states: states,
       actions: actions,
       guards: guards,
@@ -534,7 +585,9 @@ defmodule Machine do
   # end
 
   def get_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}) do
-    if String.at(to, 0) === "#" do
+    # IMMEDIATE TODO: Zenith was failing to start due to "to" being nil when String.at was called...
+    # Need to refine this so that whatever the statechart interprets doesn't crash...
+    if to !== nil && String.at(to, 0) === "#" do
       # NOTE: This is to ensure that we have a path from #statechart_id.nested_state
       to
     else
@@ -548,7 +601,11 @@ defmodule Machine do
         to in Utils.safe_list(child_states) ->
           "#{state_name}.#{to}"
         to === nil ->
-          state_name
+          # NOTE/TODO: Make sure this change isn't breaking anything
+          #            But this change is necessary, otherwise the "RUN_ACTIONS" case clause in handle_transitions
+          #            never executes.
+          # state_name
+          nil
         true -> raise "ERROR: You specified a target state of '#{to}', but it isn't a sibling or child of the state that you're attempting to transition out of. Include an absolute path to target a higher level state or include the necessary sibling or child state in the statechart."
       end
     end
@@ -993,6 +1050,7 @@ defmodule Machine do
       "current_state" => current_state,
       "parallel_state_key" => parallel_state_key,
       "context" => statechart |> Map.get("context"),
+      # "on" => statechart |> Map.get("on"),
       "states" => states,
       "actions" => actions,
       "guards" => guards
@@ -1031,6 +1089,7 @@ defmodule Machine do
       "id" => id,
       "current_state" => current_state,
       "parallel_state_key" => parallel_state_key,
+      # "on" => nil,
       "context" => context,
       "states" => states,
       "actions" => actions,

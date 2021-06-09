@@ -1,6 +1,9 @@
 defmodule Meditative do
   @moduledoc """
   Documentation for `Meditative`.
+
+  Transition Execution Events:
+  actions -> (on_exit && on_entry) -> transient_transition -> update the current_state
   """
 
   defdelegate interpret(statechart), to: Machine
