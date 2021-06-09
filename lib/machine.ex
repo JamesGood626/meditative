@@ -490,7 +490,6 @@ defmodule Machine do
       #   raise "DEVELOPER ERROR: You may not have transitions with the same name on the global 'on' transitions map and in \
       #          a specific finite state's 'on' transition map. event: #{event} current_state: #{current_state}"
       # end
-      
       target_state = transition |> get_target_state |> get_state(states)
       next_step = determine_next_transition_step(%{
         "transition" => transition,
