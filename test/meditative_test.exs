@@ -434,6 +434,7 @@ defmodule MeditativeTest do
   test "Machine which has a transition with an action and no transition target, may trigger a transition from within the action." do
     actions = %{
       "increment_and_transition_finite_state" => fn (context, event) ->
+        
                       count = context |> Map.get("count")
                       {"TRANSITION_TO_B", %{"count" => count + 1}}
                      end
