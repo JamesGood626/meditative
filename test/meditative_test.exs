@@ -9,6 +9,7 @@ defmodule MeditativeTest do
   # Need to support global events... (which will be executed no matter what the current state is)
   # Reference XState
 
+
   setup_all do
     actions = %{
       # If the action function returns an Assign struct, then update

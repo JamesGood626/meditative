@@ -11,4 +11,5 @@ defmodule Meditative do
   defdelegate persist(statechart), to: Machine
   defdelegate hydrate(statechart, opts, persisted_state), to: Machine
   defdelegate transition(machine, event), to: Machine
+
 end

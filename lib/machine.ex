@@ -260,6 +260,7 @@ defmodule Machine do
     invoke_action(%{"machine" => machine, "action" => action, "context" => context, "event" => event})
   end
 
+
   def apply_actions(%{
     "machine" => machine,
     "actions" => actions,
