@@ -34,7 +34,7 @@ Features currently present (TODO: include docs/example usage and test):
 Features yet to be added:
 
 - Conditional Actions
-- Invoke
+- Invoke (Promises, Actors, etc...)
 - History States
 
 Other keys to add on the options (second argument to Machine.interpret/2) along with actions and guards are:
@@ -43,3 +43,5 @@ Other keys to add on the options (second argument to Machine.interpret/2) along 
 - delays
 - services
 - updater
+
+TODO: Create an Elixir Forum post of the above notes and inquire as to whether anyone would be interested in this feature set being published as an open source library (cause I'm an open source newb).

@@ -4,16 +4,94 @@ defmodule Machine do
   alias State
   alias Transition
 
-  defstruct [:id, :current_state, :parallel_state_key, :context, :on, :states, :actions, :guards]
+  defstruct [:id, :current_state, :parallel_state_key, :context, :on, :states, :actions, :guards, :invoke_sources]
+
+  # THis comment (in the nature of Software Architecture)...
+  # https://www.reddit.com/r/elixir/comments/np688d/why_is_there_no_need_for_asyncawait_in_elixir/h03pttm?utm_source=share&utm_medium=web2x&context=3
+
+  # Comment regarding BEAM VM Concurrency:
+  # https://www.reddit.com/r/elixir/comments/np688d/why_is_there_no_need_for_asyncawait_in_elixir/h065lif?utm_source=share&utm_medium=web2x&context=3
+
+  # TODO:
+  # The invoke key under a state:
+  # But... instead of having src capable of being defined inline, would prefer to
+  # have an :invoke_sources key on the Machine, and the actual functions to be invoked must be passed in to Machine.interpret/2
+  # in a similar fashion as actions and guards.
+  # invoke: {
+  #   id: 'getUser',
+  #   src: (context, event) => fetchUser(context.userId),
+  #   onDone: {
+  #     target: 'success',
+  #     actions: assign({ user: (context, event) => event.data })
+  #   },
+  #   onError: {
+  #     target: 'failure',
+  #     actions: assign({ error: (context, event) => event.data })
+  #   }
+  # }
+
+
+  # IMMEDIATE TODO:
+  # This design needs to be simplified...
+  # transition -> (handle_transition, parallel_state_transition, determine_next_transition_step, get_transition_associated_with_event, get_target_state, get_state, get_guard, run_cond) -> apply_transient_transition -> ((apply_actions -> invoke_action -> get_action_function), run_cond, get_guard, get_target_state, get_state run_on_entry, run_on_exit)
 
   def get_id(statechart) do
     statechart
     |> Map.get("id")
+    # TODO: Necessary to perform some kind of validation on the id?
     |> Cat.to_either("You must provide an id to the statechart")
     |> Cat.either(fn msg -> raise msg end, fn val -> val end)
     |> Cat.unwrap
   end
 
+  @doc """
+  iex> statechart = %{
+  iex>    "id" => "meditative",
+  iex>    "initial_state" => "p",
+  iex>    "context" => %{
+  iex>      "count" => 0,
+  iex>      "name" => nil
+  iex>    },
+  iex>    "states" => %{
+  iex>      "green" => %{
+  iex>        "on" => %{
+  iex>          "YELLOW" => "yellow"
+  iex>        }
+  iex>      },
+  iex>      "yellow" => %{
+  iex>        "type" => "final"
+  iex>      }
+  iex>    }
+  iex>  }
+  iex> Machine.get_constructed_states(statechart, "#meditative")
+  %{
+    "#meditative.green" => %State{
+      initial_state: nil,
+      name: "#meditative.green",
+      on: %{
+        "YELLOW" => %Transition{actions: nil, event: "YELLOW", from: "#meditative.green", guard: nil, to: "#meditative.yellow"}
+      },
+      on_entry: nil,
+      on_exit: nil,
+      parallel_states: nil,
+      type: nil
+    },
+    "#meditative.yellow" => %State{
+      initial_state: nil,
+      name: "#meditative.yellow",
+      on: %{},
+      on_entry: nil,
+      on_exit: nil,
+      parallel_states: nil,
+      type: "final"
+    }
+  }
+
+  Stratified Design:
+
+  Highest Level          -> Medium Level     -> Lowest Level
+  get_constructed_states/2 -> construct_states/2 -> (get_state_without_sub_states/2, get_states_sub_states/2)
+  """
   def get_constructed_states(statechart, id) do
     statechart
     |> Cat.maybe
@@ -21,20 +99,46 @@ defmodule Machine do
     ~>> fn x -> construct_states(x, id) end
     ~>> fn x ->
           Enum.reduce(x, %{}, fn ({state_name, %State{} = s}, acc) ->
-          acc |> Map.put(state_name, s)
+          Map.put(acc, state_name, s)
         end)
       end
     |> Cat.unwrap
   end
 
+  @doc """
+  iex> states = %{
+  iex>    "finite_state_one" => %{
+  iex>      "on" => %{ "EVENT" => "finite_state_two" }
+  iex>    },
+  iex>    "finite_state_two" => %{
+  iex>      "on" => %{ "EVENT" => "finite_state_one" }
+  iex>    }
+  iex> }
+  iex> Machine.get_state_without_sub_states(states, "finite_state_two")
+  %{"on" => %{"EVENT" => "finite_state_one"}}
+  """
   def get_state_without_sub_states(states, state_name) do
     states
     |> Cat.maybe
-    ~>> fn x -> x |> Map.get(state_name) end
-    ~>> fn x -> x |> Map.delete("states") end
+    ~>> fn x -> Map.get(x, state_name) end
+    ~>> fn x -> Map.delete(x, "states") end
     |> Cat.unwrap
   end
 
+
+  @doc """
+  iex> states = %{
+  iex>    "finite_state_one" => %{
+  iex>      "states" => %{
+  iex>         "nested_finite_state" => %{
+  iex>             "on" => %{ "EVENT" => "finite_state_one" }
+  iex>         }
+  iex>       }
+  iex>    }
+  iex> }
+  iex> Machine.get_states_sub_states(states, "finite_state_one")
+  %{"nested_finite_state" => %{"on" => %{"EVENT" => "finite_state_one"}}}
+  """
   def get_states_sub_states(states, state_name) do
     states
     |> Cat.maybe
@@ -47,7 +151,7 @@ defmodule Machine do
   def get_target_state(%Transition{} = transition) do
     transition
     |> Cat.maybe
-    ~>> fn x -> Map.get(x, :to) end
+    ~>> fn x -> Map.get(x, :to) end # NOTE/TODO: If Exotic had flip and curry functions... could be used here.
     |> Cat.unwrap
   end
 
@@ -61,6 +165,10 @@ defmodule Machine do
   def get_event(event) when is_binary(event), do: event
   def get_event(%{"type" => event}), do: event
 
+  @doc """
+  NOTE: Could test this... it is one of the lowest level functions, but just as some of the other functions
+  above, it almost seems too simple to even bother testing it.
+  """
   def get_action_function(machine, action) do
     machine
     |> Cat.maybe
@@ -69,6 +177,7 @@ defmodule Machine do
     |> Cat.unwrap
   end
 
+  # This does largely the same thing as get_action_function, but with guard functions.
   def get_guard(nil), do: nil
   def get_guard(%Transition{} = transition) do
     transition
@@ -92,7 +201,7 @@ defmodule Machine do
     ~>> fn x -> Map.get(x, get_event(event)) end
     ~>> fn xs when is_list(xs) ->
             xs
-            |> Enum.find(fn (%Transition{guard: guard} = transition) -> run_cond(%{"machine" => machine, "guard" => guard, "context" => context})
+            |> Enum.find(fn (%Transition{guard: guard}) -> run_cond(%{"machine" => machine, "guard" => guard, "context" => context})
                               x -> x
                           end)
            x -> x
@@ -110,13 +219,6 @@ defmodule Machine do
 
   def get_on_entry(state), do: Map.get(state, :on_entry)
   def get_on_exit(state), do: Map.get(state, :on_exit)
-
-  def apply_actions(%{
-    "actions" => nil,
-    "context" => context
-  }) do
-    {nil, context}
-  end
 
   def invoke_guard(%{"machine" => machine, "guard" => guard, "context" => context}) do
     guard_func = get_guard_function(machine, guard)
@@ -140,6 +242,13 @@ defmodule Machine do
             Map.merge(context, context_updates, fn _k, _v1, v2 -> v2 end)
         end
     end
+  end
+
+  def apply_actions(%{
+    "actions" => nil,
+    "context" => context
+  }) do
+    {nil, context}
   end
 
   def apply_actions(%{
@@ -179,7 +288,7 @@ defmodule Machine do
     |> get_on_exit
     |> Utils.to_list
     |> Enum.reduce(context, fn (action, updated_context) ->
-      invoke_action(%{"machine" => machine, "action" => action, "context" => updated_context, "event" => event}) |> IO.inspect
+      invoke_action(%{"machine" => machine, "action" => action, "context" => updated_context, "event" => event})
     end)
   end
 
@@ -245,8 +354,8 @@ defmodule Machine do
 
   def determine_next_transition_step(%{
     "transition" => conditional_transitions,
-    "target_state" => target_state,
-    "cond_result" => cond_result,
+    "target_state" => _target_state,
+    "cond_result" => _cond_result,
     "machine" => machine,
     "context" => context
   }) when is_list(conditional_transitions) do
@@ -258,14 +367,14 @@ defmodule Machine do
   end
 
   def determine_next_transition_step(%{
-    "transition" => %Transition{to: nil, actions: actions} = transition,
+    "transition" => %Transition{to: nil, actions: _actions} = transition,
     "cond_result" => true
   }) do
     {"RUN_ACTIONS", transition}
   end
 
   def determine_next_transition_step(%{
-    "transition" => %Transition{to: to, actions: actions} = transition,
+    "transition" => %Transition{to: _to, actions: _actions} = transition,
     "cond_result" => true
   }) do
     {"TRANSITION", transition}
@@ -289,7 +398,7 @@ defmodule Machine do
 
   For example, parallel_state_key will be #meditative.p
   """
-  def parallel_state_transition(%Machine{current_state: current_state, parallel_state_key: parallel_state_key, states: states, context: context, guards: guards} = machine, event) do
+  def parallel_state_transition(%Machine{current_state: current_state, parallel_state_key: parallel_state_key, states: states, context: _context, guards: _guards} = machine, event) do
     parallel_state = Map.get(states, parallel_state_key)
     state_to_update =
       parallel_state
@@ -327,15 +436,53 @@ defmodule Machine do
           end).()
   end
 
+  def handle_executing_invoke_sources(machine, context, state) do
+    # IO.puts("the state")
+    # IO.inspect(state)
+    # NOTE/FUTURE TODO: "#meditative.p.region1.foo2" <- The Map.get(state) below will return nil... because
+    # it's a parallel state. Will need to fix this once I handle the refactor...
+
+    result =
+      machine
+      |> Map.get(:states)
+      |> Map.get(state)
+      |> Cat.maybe
+      ~>> fn x -> Map.get(x, :invoke) end
+      ~>> fn %{"id" => id, "src" => src, "on_done" => on_done, "on_error" => on_error} ->
+        # 1. Grab the invoke function from the Machine struct under :invoke_sources via the src string
+        # 2. Invoke the lambda function which was retrieved via the src string
+        invoke_source_fn = machine |> Cat.maybe ~>> fn x -> Map.get(x, :invoke_sources) end ~>> fn x -> Map.get(x, src) end |> Cat.unwrap
+
+        if invoke_source_fn === nil || !is_function(invoke_source_fn) do
+          raise "DEVELOPER ERROR: the function provided for the invoke src #{src} under state #{state} is not a function."
+        end
+
+        task = Task.async(fn -> invoke_source_fn.(context) end)
+        case Task.await(task) do
+          # {transition_struct, event}
+          {:ok, data} ->
+            {on_done, %{"type" => "INVOKE_SOURCE_ON_DONE_TRANSITION", "invoke_id" => id, "payload" => data}}
+          {:error, data} ->
+            {on_error, %{"type" => "INVOKE_SOURCE_ON_ERROR_TRANSITION", "invoke_id" => id, "payload" => data}}
+        end
+      end
+      |> Cat.unwrap
+
+    case result do
+      nil -> :no_invoke
+      {transition_due_to_invoke, next_event} -> {:invoke, {transition_due_to_invoke, next_event}}
+    end
+  end
+
   def handle_transition(%{
     "next_step" => next_step,
-    "transition" => transition,
+    # "transition" => _transition,
     "machine" => machine,
     "context" => context,
     "event" => event,
     "states" => states,
     "from_state" => from_state,
-    "target_state" => target_state,
+    "target_state" => target_state, # Needs to be a State struct
   }) do
     case next_step do
       {"TRANSITION", %Transition{to: to, actions: actions}} ->
@@ -356,9 +503,80 @@ defmodule Machine do
           "machine" => machine,
           "context" => context
         })
-      %{"new_context" => new_context, "to" => to} =
-            apply_transient_transition(%{"machine" => machine, "transition" => transient_transition, "context" => new_context, "event" => event, "states" => states, "state" => from_state, "fallback_to" => to})
-        %{machine | current_state: target_state |> Cat.maybe ~>> fn x -> Map.get(x, :initial_state) end |> Cat.unwrap || to, context: new_context}
+        %{"new_context" => new_context, "to" => to} =
+              apply_transient_transition(%{"machine" => machine, "transition" => transient_transition, "context" => new_context, "event" => event, "states" => states, "state" => from_state, "fallback_to" => to})
+        # LLO/IMMEDIATE TODO: Without going through a major refactor... I believe this is the location
+        # where handling calling the invoke_source provided by the user.
+        # How does this resolve when there's both a transient transition and an invoke source?!
+        # ^^ Or should this be an invariant which should never be allowed, i.e. no transient transition and invoke source
+        # may be defined simultaneously for any given state.
+        # Implementing the invariant is really easy... create a function which takes in the result of getting the transient transition
+        # and the result of getting any potential declared invoke sources, pass both into a function
+        # one or the other should be nil (pattern matched in the head of a multiclause funcion), else the third case
+        # will be the error warning the user of an invalid declaration (BUT this is a rather late time to warn of this...
+        # would be better to maintain this invariant during the Machine.interpret/2 phase, however this could work for temporary purposes).
+
+        # ^^ Then the apply_transient_transition would be invoked inside of that function which maintains the invariant, or the
+        # function which actually invokes the invoke_source.
+        # The function which invokes the invoke source, will use
+        # task = Task.async(fn -> function_user_gave_as_invoke_src end)
+        # and Task.await(task)
+        # The user's function provided as invoke_src MUST return either {:ok, val} || {:err, msg}
+        # The return result of which will be used to determine whether to invoke onDone or onError.
+        # iex(3)> task = Task.async(fn -> {:ok, "jdsajkda"} end)
+        # %Task{
+        #   owner: #PID<0.106.0>,
+        #   pid: #PID<0.111.0>,
+        #   ref: #Reference<0.1819233756.2573467651.99064>
+        # }
+        # iex(4)> Task.await(task)
+        # {:ok, "jdsajkda"}
+        # iex(5)> task = Task.async(fn -> {:error, "jdsajkda"} end)
+        # %Task{
+        #   owner: #PID<0.106.0>,
+        #   pid: #PID<0.114.0>,
+        #   ref: #Reference<0.1819233756.2573467651.99087>
+        # }
+        # iex(6)> Task.await(task)
+        # {:error, "jdsajkda"}
+
+        # There's one more subtle aspect to the invoke feature in relation to this transition/2 function...
+        # Handling invoke will typically be done after having transitioned successfully to the target state.
+        # So we need to retrieve the target_state that will be set to the current_state below, and then check if there's
+        # any registered invoke source, if so then we go through the process outlined above, and potentially transitioning
+        # to the states declared on the onDone/onError keys.
+        ending_state = target_state |> Cat.maybe ~>> fn x -> Map.get(x, :initial_state) end |> Cat.unwrap || to
+        case handle_executing_invoke_sources(machine, new_context, ending_state) do
+          :no_invoke ->
+            %{machine | current_state: ending_state, context: new_context}
+
+          {:invoke, {%Transition{to: to} = transition_struct, next_event}} ->
+            # {on_done, %{"type" => "INVOKE_SOURCE_ON_DONE_TRANSITION", "invoke_id" => id, "payload" => data}}
+            # {on_error, %{"type" => "INVOKE_SOURCE_ON_ERROR_TRANSITION", "invoke_id" => id, "payload" => data}}
+            handle_transition(%{
+              "next_step" => {"TRANSITION", transition_struct},
+              "machine" => machine,
+              "context" => new_context,
+              "event" => next_event,
+              "states" => states,
+              "from_state" => Map.get(machine, :states) |> Map.get(ending_state),
+              "target_state" => Map.get(machine, :states) |> Map.get(to), # TODO: Would probably be a good idea to use Either here...
+            })
+
+          {:invoke, {to, next_event}} ->
+            # {on_done, %{"type" => "INVOKE_SOURCE_ON_DONE_TRANSITION", "invoke_id" => id, "payload" => data}}
+            # {on_error, %{"type" => "INVOKE_SOURCE_ON_ERROR_TRANSITION", "invoke_id" => id, "payload" => data}}
+            handle_transition(%{
+              "next_step" => {"TRANSITION", %Transition{to: to}},
+              "machine" => machine,
+              "context" => new_context,
+              "event" => next_event,
+              "states" => states,
+              "from_state" => Map.get(machine, :states) |> Map.get(ending_state),
+              "target_state" => Map.get(machine, :states) |> Map.get(to),
+            })
+        end
+
         # TODO: Add code to enable actions (associated with a Transition that doesn't specify a target)
         #       to trigger transitions by returning {"TRANSITION_TO_TRIGGER", payload}
         # Would just need to invoke:
@@ -389,7 +607,7 @@ defmodule Machine do
           {nil, new_context} -> %{machine | context: new_context}
           {transition_event, new_context} ->
             updated_machine = %{machine | context: new_context}
-            # LLO/WTF
+            # NOTE: Unsure if I should leave this... but I will for now.
             Machine.transition(updated_machine, transition_event)
         end
       "NO_TRANSITION" ->
@@ -399,6 +617,8 @@ defmodule Machine do
         raise "UNEXPECTED ERROR: in Machine.transition/2"
     end
   end
+
+
 
   # TODO:
   # event can be either a string or a map which stores the string under the key :type + any arbitrary key the user wants to use
@@ -416,7 +636,7 @@ defmodule Machine do
     if is_list(current_state) do
       # transition parallel state...
       case parallel_state_transition(machine, event) do # |> Cat.trace("Result of parallel_state_transition")
-        {idx, from, %Transition{to: to} = transition} ->
+        {idx, _from, %Transition{to: to} = transition} ->
           parallel_state_key = machine |> Map.get(:parallel_state_key)
           if parallel_state_key === nil do raise "OPEN SOURCE DEVELOPER ERROR: If state is in a parallel configuration, then :parallel_state_key on %Machine{} should never be nil!!!" end
           parallel_states = machine |> Map.get(:states) |> Map.get(parallel_state_key) |> Map.get(:parallel_states) |> Map.get("states")
@@ -523,7 +743,8 @@ defmodule Machine do
     # "on" => on,
     "states" => states,
     "actions" => actions,
-    "guards" => guards
+    "guards" => guards,
+    "invoke_sources" => invoke_sources
   } = rest) do
     %__MODULE__{
       id: id,
@@ -534,6 +755,7 @@ defmodule Machine do
       states: states,
       actions: actions,
       guards: guards,
+      invoke_sources: invoke_sources,
       # send: &transition/2 # fn (machine, event) -> transition(machine, event) end
     }
   end
@@ -611,9 +833,9 @@ defmodule Machine do
   end
 
   @doc """
-  iex(5)> s |> String.split(".") |> Enum.slice(0, 2)
+  > s |> String.split(".") |> Enum.slice(0, 2)
   ["#meditative", "first_step"]
-  iex(6)> s |> String.split(".") |> Enum.slice(0, 1)
+  > s |> String.split(".") |> Enum.slice(0, 1)
   ["#meditative"]
   """
   def construct_transitions(nil, _), do: nil
@@ -742,6 +964,30 @@ defmodule Machine do
           [combined_state_names | result]
       end
     end
+  end
+
+  # convert_on_done_on_error && create_invoke_map are a quick hack...
+  # The issue was that you needed to create the relative state path in relation to the top most level states
+  # for the states provided to the invoke map,
+  # I know this works for at least first level states that hacve invoke....
+  # TODO: Need to ensure that this can work for nested states.
+  #       And then parallel states whenever that is gotten to.
+  def convert_on_done_on_error(%{"to" => to } = rest, name), do:
+    %{rest | "to" => "#{name |> String.split(".") |> Enum.drop(-1) |> Enum.join(".")}.#{to}"}
+  def convert_on_done_on_error(to, name) when is_binary(to), do:
+    "#{name |> String.split(".") |> Enum.drop(-1) |> Enum.join(".")}.#{to}"
+
+  def create_invoke_map(nil, _), do: nil
+  def create_invoke_map(%{"id" => id, "src" => src, "on_done" => on_done, "on_error" => on_error}, name) do
+    converted_on_done = convert_on_done_on_error(on_done, name)
+    converted_on_error = convert_on_done_on_error(on_error, name)
+
+    %{
+      "id" => id,
+      "src" => src,
+      "on_done" => converted_on_done,
+      "on_error" => converted_on_error
+    }
   end
 
   @doc """
@@ -943,8 +1189,8 @@ defmodule Machine do
           if type === "parallel" do
             # para
             parallel_state_names = child_states |> Cat.maybe ~>> fn m -> Map.keys(m) end ~>> fn keys -> Enum.map(keys, fn key -> "#{name}.#{key}"end) end |> Cat.unwrap || [name]
-            parallel_state_names # |> Cat.trace("WTF is parallel_state_names")
-            names = create_parallel_state_names(%{
+            # parallel_state_names # |> Cat.trace("WTF is parallel_state_names")
+            create_parallel_state_names(%{
               "state_name" => name,
               "transitions" => transitions,
               "child_states" => child_states
@@ -960,7 +1206,8 @@ defmodule Machine do
               "parallel_states" => %{
                 "parallel_state_names" => parallel_state_names, # TODO/NOTE: Don't thinmkl the names created vcia create_parallel_state_names are necessary... ++ names,
                 "states" => construct_states(child_states, name, [{name, state} | acc])  |> Utils.to_map
-              }
+              },
+              # "invoke" => state |> Map.get("invoke"), TODO: To be supported after a later refactor.
             })
 
             [{name, state}]
@@ -990,10 +1237,11 @@ defmodule Machine do
               "initial_state" => state |> maybe ~>> fn x -> Map.get(x, "initial_state") end ~>> fn x -> "#{name}.#{x}" end |> Cat.unwrap,
               "on_entry" => state |> Map.get("on_entry"),
               "on_exit" => state |> Map.get("on_exit"),
-              "type" => type
+              "type" => type,
+              "invoke" => create_invoke_map(state |> Map.get("invoke"), name),
             })
 
-            state # |> Cat.trace("state being passed to construct_states/3")
+            # state # |> Cat.trace("state being passed to construct_states/3")
             construct_states(child_states, name, [{name, state} | acc])
           end
         end)
@@ -1001,12 +1249,13 @@ defmodule Machine do
     end
   end
 
-  def interpret(statechart), do: interpret(statechart, %{"actions" => nil, "guards" => nil})
-  def interpret(statechart, %{"actions" => actions, "guards" => guards}) do
+  def interpret(statechart), do: interpret(statechart, %{"actions" => nil, "guards" => nil, "invoke_sources" => nil})
+  # opts = %{"actions" => actions, "guards" => guards, "invoke_sources" => invoke_sources})
+  def interpret(statechart, opts) do
     # Run the steps necessary to create the State and Transition structs
     # then invoke new to create a new Machine
     id = statechart |> get_id
-    states = statechart |> get_constructed_states("##{id}")
+    states = statechart |> get_constructed_states("##{id}") # <- TODO: grab the invoke key from inside this function?
       # |> Map.get("states")
       # |> construct_states("##{id}")
       # |> Enum.reduce(%{}, fn ({state_name, %State{} = s}, acc) ->
@@ -1051,8 +1300,9 @@ defmodule Machine do
       "context" => statechart |> Map.get("context"),
       # "on" => statechart |> Map.get("on"),
       "states" => states,
-      "actions" => actions,
-      "guards" => guards
+      "actions" => opts |> Map.get("actions"),
+      "guards" => opts |> Map.get("guards"),
+      "invoke_sources" => opts |> Map.get("invoke_sources")
     })
   end
 
@@ -1074,7 +1324,7 @@ defmodule Machine do
   """
   def hydrate(
     statechart,
-    %{"actions" => actions, "guards" => guards},
+    %{"actions" => actions, "guards" => guards} = opts,
     %{
       "current_state" => current_state,
       "context" => context,
@@ -1092,7 +1342,8 @@ defmodule Machine do
       "context" => context,
       "states" => states,
       "actions" => actions,
-      "guards" => guards
+      "guards" => guards,
+      "invoke_sources" => opts |> Map.get("invoke_sources")
     })
   end
 

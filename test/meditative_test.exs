@@ -468,4 +468,96 @@ defmodule MeditativeTest do
       assert state_before_transition === "#meditative.a"
       assert state_after_transition === "#meditative.b"
   end
+
+  test "Machine runs actions first, followed by guards whenever an incoming transition event is received" do
+    actions = %{
+      # TODO/NOTE: This is a fucked situation... test fails if I just return %{"count" => 1} from the action function.
+      "set_necessary_context_to_fulfill_transition" => fn (context, event) -> {nil, %{"count" => 1}} end,
+      "set_necessary_context_to_avoid_transition" => fn (context, event) -> %{"count" => 0} end
+    }
+
+    guards = %{
+      "count_is_not_zero?" => fn %{"count" => count} -> count !== 0 end
+    }
+
+    statechart = %{
+      "id" => "meditative",
+      "initial_state" => "a",
+      "context" => %{
+        "count" => 0
+      },
+      "states" => %{
+        "a" => %{
+          "on" => %{
+            "DO_IT" => %{
+              "target" => "b",
+              "actions" => "set_necessary_context_to_fulfill_transition",
+              "guards" => "count_is_not_zero?"
+            },
+          }
+        },
+        "b" => %{
+          "DO_IT" => %{
+            "target" => "a",
+            "actions" => "set_necessary_context_to_avoid_transition",
+            "guards" => "count_is_not_zero?"
+          },
+        }
+      }
+    }
+
+    machine = Meditative.interpret(statechart, %{"actions" => actions, "guards" => nil})
+    state_before_transition = machine |> Map.get(:current_state)
+    updated_machine = Meditative.transition(machine, "DO_IT")
+    state_after_first_transition = updated_machine |> Map.get(:current_state)
+    updated_machine = Meditative.transition(updated_machine, "DO_IT")
+    state_after_second_transition = updated_machine |> Map.get(:current_state)
+
+    assert state_before_transition === "#meditative.a"
+    assert state_after_first_transition === "#meditative.b"
+    assert state_after_second_transition === "#meditative.b" # NOTE: it didn't transition.. which is the desired behavior.
+  end
+
+  test "Meditative statecharts support the invoke feature" do
+    invoke_sources = %{
+      "c_invoke_src_func" => fn context ->
+        {:ok, %{"data" => "Http response"}}
+      end
+    }
+
+    statechart = %{
+      "id" => "meditative",
+      "initial_state" => "a",
+      "context" => %{
+        "count" => 0
+      },
+      "states" => %{
+        "a" => %{
+          "on" => %{ "DO_IT" => "d" }
+        },
+        "b" => %{
+          "on" => %{ "DO_IT" => "c" }
+        },
+        "c" => %{
+          "on" => %{ "DO_IT" => "c" }
+        },
+        "d" => %{
+          "invoke" => %{
+            "id" => "c_invoke_src",
+            "src" => "c_invoke_src_func",
+            "on_done" => "b",
+            "on_error" => "c",
+          }
+        }
+      }
+    }
+
+    machine = Meditative.interpret(statechart, %{"actions" => nil, "guards" => nil, "invoke_sources" => invoke_sources})
+    state_before_transition = machine |> Map.get(:current_state)
+    updated_machine = Meditative.transition(machine, "DO_IT")
+    state_after_transition = updated_machine |> Map.get(:current_state)
+
+    assert state_before_transition === "#meditative.a"
+    assert state_after_transition === "#meditative.b"
+  end
 end

@@ -13,7 +13,7 @@ defmodule State do
   }
   """
 
-  defstruct [:name, :on, :on_entry, :on_exit, :type, :initial_state, :parallel_states]
+  defstruct [:name, :on, :on_entry, :on_exit, :type, :initial_state, :parallel_states, :invoke]
 
   def new(%{
     "name" => name,
@@ -30,7 +30,8 @@ defmodule State do
       on_entry: on_entry,
       on_exit: on_exit,
       type: type, # TODO: add the fetching of type from the statechart on interpretation (for indicating a final state)
-      parallel_states: rest |> Map.get("parallel_states")
+      parallel_states: rest |> Map.get("parallel_states"),
+      invoke: rest |> Map.get("invoke")
     }
   end
 end
