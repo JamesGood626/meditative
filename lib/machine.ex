@@ -315,7 +315,8 @@ defmodule Machine do
     "state" => state,
     "fallback_to" => fallback_to
     }) do
-    target_state = transition |> get_target_state |> get_state(states)
+      get_target_state_struct_via_transition(transition, states)
+    target_state = get_target_state_struct_via_transition(transition, states)
     case {transition, run_cond(%{"machine" => machine, "guard" => get_guard(transition), "context" => context})} do
       {%Transition{to: to, actions: actions}, true} ->
         {_, new_context} = apply_actions(%{
@@ -399,7 +400,7 @@ defmodule Machine do
 
   For example, parallel_state_key will be #meditative.p
   """
-  def parallel_state_transition(%Machine{current_state: current_state, parallel_state_key: parallel_state_key, states: states, context: _context, guards: _guards} = machine, event) do
+  def get_parallel_state_transition(%Machine{current_state: current_state, parallel_state_key: parallel_state_key, states: states, context: _context, guards: _guards} = machine, event) do
     parallel_state = Map.get(states, parallel_state_key)
     state_to_update =
       parallel_state
@@ -423,6 +424,7 @@ defmodule Machine do
               ~>> (fn %Transition{from: from} = transition ->
                     acc # |> Cat.trace("WTF is acc inside the ~>> that pattern matches on %Transition{}")
                     if (from === Enum.at(current_state, idx)) do
+
                       {idx, x, transition} # |> Cat.trace("setting acc in if statement reduce to...")
                     end
                   end)
@@ -551,11 +553,11 @@ defmodule Machine do
           :no_invoke ->
             %{machine | current_state: ending_state, context: new_context}
 
-          {:invoke, {%Transition{to: to} = transition_struct, next_event}} ->
+          {:invoke, {%{"target" => to} = transition_map, next_event}} ->
             # {on_done, %{"type" => "INVOKE_SOURCE_ON_DONE_TRANSITION", "invoke_id" => id, "payload" => data}}
             # {on_error, %{"type" => "INVOKE_SOURCE_ON_ERROR_TRANSITION", "invoke_id" => id, "payload" => data}}
             handle_transition(%{
-              "next_step" => {"TRANSITION", transition_struct},
+              "next_step" => {"TRANSITION", %Transition{to: transition_map |> Map.get("to"), actions: transition_map |> Map.get("actions")}},
               "machine" => machine,
               "context" => new_context,
               "event" => next_event,
@@ -619,34 +621,50 @@ defmodule Machine do
     end
   end
 
+  def get_from_state_struct_from_machine(%Machine{current_state: current_state}, parallel_states, {:parallel_state, from}) do
+    parallel_states |> Cat.maybe ~>> fn x -> Map.get(x, from) end |> Cat.unwrap
+  end
 
 
-  # TODO:
-  # event can be either a string or a map which stores the string under the key :type + any arbitrary key the user wants to use
-  # to establish some kind of additional metadata for the transition.
-  def transition(%Machine{current_state: current_state, states: states, context: context, guards: guards} = machine, event) do
-    # 1. Retrieve current_state from machine
-    # current_state = machine |> Map.get("current_state") |> IO.inspect
-    #   1a.
-    #      2a. Check if the current_state is a parallel state... (if it's a list)
-    #          If so, then run the steps in the moduledoc of the Machine module.
-    #   1b.
-    #       2b. retrieve the corresponding current_state Struct from the states list
-    #       IO.puts("THE MACHINE IN TRANSITION/2")
-    #       IO.inspect(machine)
-    if is_list(current_state) do
-      # transition parallel state...
-      case parallel_state_transition(machine, event) do # |> Cat.trace("Result of parallel_state_transition")
-        {idx, _from, %Transition{to: to} = transition} ->
-          parallel_state_key = machine |> Map.get(:parallel_state_key)
-          if parallel_state_key === nil do raise "OPEN SOURCE DEVELOPER ERROR: If state is in a parallel configuration, then :parallel_state_key on %Machine{} should never be nil!!!" end
-          parallel_states = machine |> Map.get(:states) |> Map.get(parallel_state_key) |> Map.get(:parallel_states) |> Map.get("states")
-          from_state = parallel_states |> Cat.maybe ~>> fn x -> Map.get(x, current_state |> Enum.at(idx)) end |> Cat.unwrap # |> Cat.trace("what is state...")
+  def get_from_state_struct_from_machine(%Machine{current_state: current_state}, states) do
+    states |> Cat.maybe ~>> fn x -> Map.get(x, current_state) end |> Cat.unwrap
+  end
+
+  def get_target_state_struct_via_transition(transition, states) do
+    transition |> get_target_state |> get_state(states)
+  end
+
+  def get_parallel_states(machine) do
+    parallel_state_key = machine |> Map.get(:parallel_state_key)
+    if parallel_state_key === nil do raise "OPEN SOURCE DEVELOPER ERROR: If state is in a parallel configuration, then :parallel_state_key on %Machine{} should never be nil!!!" end
+    machine |> Map.get(:states) |> Map.get(parallel_state_key) |> Map.get(:parallel_states) |> Map.get("states")
+  end
+
+  def update_current_state_parallel_configuration(current_state, idx, to) do
+    List.update_at(current_state, idx, fn _ -> to end)
+  end
+
+  # LLO/TODO:
+  # next step would be to see if I can get a majority of the parallel_states/states/target_state/next_step
+  # variable assignments in both handle_parallel_transition/1 and handle_normal_transition/1
+  # to be in a single function which can be reused in both... (and create the pipeline in such a way
+  # that it's extensible in the future for any additional features to be added.)
+  def handle_parallel_transition(%{
+    "machine" => %Machine{current_state: current_state, states: states, context: context} = machine,
+    "event" => event,
+  }) do
+    case get_parallel_state_transition(machine, event) do # |> Cat.trace("Result of parallel_state_transition")
+        {idx, _from, %Transition{to: to, from: from} = transition} ->
+          # TODO: Fix the disconnect between the sequencing of whether this transition is within a parallel
+          # and the retrieval of the parallel states...
+          parallel_states = get_parallel_states(machine)
+
+          from_state = get_from_state_struct_from_machine(machine, parallel_states, {:parallel_state, from})
           # transition |> Cat.trace("transition in the pattern match on parallel_state_transition(machine, event)")
 
           # NOTE: Implement something better than this... the part the follows after || is meant to handle cases where we're transitioning
           #       out of the parallel state configuration.
-          target_state = transition |> get_target_state |> get_state(parallel_states) || transition |> get_target_state |> get_state(states) # |> Cat.trace("target_state result")
+          target_state = get_target_state_struct_via_transition(transition, parallel_states) || get_target_state_struct_via_transition(transition, states)
           next_step = determine_next_transition_step(%{
             "transition" => transition,
             "target_state" => target_state,
@@ -663,38 +681,51 @@ defmodule Machine do
           # To determine if it is a transition to another parallel state... we'll take the get keys of the parallel states into a list
           # and run a simple transition.to in list_of_parallel_state_names check.
           possible_parallel_states = parallel_states |> Map.keys # |> Cat.trace("the Map.keys of the parallel_states")
+          updated_machine = handle_transition(%{
+            "next_step" => next_step,
+            "transition" => transition,
+            "machine" => machine,
+            "context" => context,
+            "event" => event,
+            "states" => parallel_states,
+            "from_state" => from_state,
+            "target_state" => target_state,
+          })
+
           if to in possible_parallel_states do
             # A transition into a parallel state
-            updated_machine = handle_transition(%{
-              "next_step" => next_step,
-              "transition" => transition,
-              "machine" => machine,
-              "context" => context,
-              "event" => event,
-              "states" => parallel_states,
-              "from_state" => from_state,
-              "target_state" => target_state,
-            })
-            %{updated_machine | current_state: List.update_at(current_state, idx, fn _ -> to end)}
+            %{updated_machine | current_state: update_current_state_parallel_configuration(current_state, idx, to)}
           else
             # A transition out of the parallel state
-            updated_machine = handle_transition(%{
-              "next_step" => next_step,
-              "transition" => transition,
-              "machine" => machine,
-              "context" => context,
-              "event" => event,
-              "states" => parallel_states,
-              "from_state" => from_state,
-              "target_state" => target_state,
-            })
             %{updated_machine | parallel_state_key: nil}
           end
+
         machine ->
+          # Transition for the event wasn't present in any of the parallel states.
           machine
       end
-    else
-      from_state = states |> Cat.maybe ~>> fn x -> Map.get(x, current_state) end |> Cat.unwrap
+  end
+
+  def handle_normal_transition(%{
+    "machine" => %Machine{states: states, context: context} = machine,
+    "event" => event
+  }) do
+      # NOTE: Doing a normal state transition
+      # do_normal_state_transition(%{
+      #   "machine" => machine,
+      #   "context" => context,
+      #   "states" => states,
+      # })
+
+      # 1. get the from_state from the state map
+      # 2. get the transition from the from state (alternatively, could be a global transition...).
+      # 3. get the target state from the state map
+      # 4. Get the next_step action (uses the target_state and transition results from steps 2 and 3 above)
+      # 5. next_step is passed to handle_transition... which actually does a lot of the sequencing of
+      #    invoking actions, guards, and possible declared invoke sources
+
+      # from_state = states |> Cat.maybe ~>> fn x -> Map.get(x, current_state) end |> Cat.unwrap
+      from_state = get_from_state_struct_from_machine(machine, states)
       # global_transition = machine |> get_transition_associated_with_event(%{
       #   "event" => event,
       #   "machine" => machine,
@@ -711,7 +742,8 @@ defmodule Machine do
       #   raise "DEVELOPER ERROR: You may not have transitions with the same name on the global 'on' transitions map and in \
       #          a specific finite state's 'on' transition map. event: #{event} current_state: #{current_state}"
       # end
-      target_state = transition |> get_target_state |> get_state(states)
+      target_state = get_target_state_struct_via_transition(transition, states)
+
       next_step = determine_next_transition_step(%{
         "transition" => transition,
         "target_state" => target_state,
@@ -733,6 +765,31 @@ defmodule Machine do
       # |> Cat.to_either("ERROR: Attempted to transition to the state: #{get_target_state(transition)}, that is not declared on the statechart!")
       # |> Cat.either(fn msg -> raise msg end, &Cat.id/1)
       # |> Cat.unwrap
+  end
+
+  # TODO:
+  # event can be either a string or a map which stores the string under the key :type + any arbitrary key the user wants to use
+  # to establish some kind of additional metadata for the transition.
+  def transition(%Machine{current_state: current_state} = machine, event) do
+    # 1. Retrieve current_state from machine
+    # current_state = machine |> Map.get("current_state") |> IO.inspect
+    #   1a.
+    #      2a. Check if the current_state is a parallel state... (if it's a list)
+    #          If so, then run the steps in the moduledoc of the Machine module.
+    #   1b.
+    #       2b. retrieve the corresponding current_state Struct from the states list
+    #       IO.puts("THE MACHINE IN TRANSITION/2")
+    #       IO.inspect(machine)
+
+    # transition -> (handle_transition, parallel_state_transition, determine_next_transition_step, get_transition_associated_with_event, get_target_state, get_state, get_guard, run_cond)
+    #            -> is_parallel_state? (true)  -> parallel_state_transition -> (get_state, get_guard, determine_next_transition_step) -> transitioning_to_another_parallel_state
+    #                                  (false) -> normal_state_transition ->                                                                                                                          -> transitioning_out_of_the_parallel_state
+
+    if is_list(current_state) do
+      # transition parallel state...
+      handle_parallel_transition(%{"machine" => machine, "event" => event})
+    else
+      handle_normal_transition(%{"machine" => machine, "event" => event})
     end
   end
 
