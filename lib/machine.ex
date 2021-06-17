@@ -621,7 +621,7 @@ defmodule Machine do
     end
   end
 
-  def get_from_state_struct_from_machine(%Machine{current_state: current_state}, parallel_states, {:parallel_state, from}) do
+  def get_from_state_struct_from_parallel_state(parallel_states, from) do
     parallel_states |> Cat.maybe ~>> fn x -> Map.get(x, from) end |> Cat.unwrap
   end
 
@@ -649,6 +649,12 @@ defmodule Machine do
   # variable assignments in both handle_parallel_transition/1 and handle_normal_transition/1
   # to be in a single function which can be reused in both... (and create the pipeline in such a way
   # that it's extensible in the future for any additional features to be added.)
+
+  # The GENERAL STRUCTURE of handle_parallel_transition and handle_normal_transition:
+  # get states || parallel_states -> get from_state -> get transition -< get target_state -> generate next_step tuple -> handle_transition
+  #      -> extra step for parallel state transition, to check if to is a possible parallel state (transitioning between another parallel state
+  #                                                                                               or transitioning out of the parallel states)
+  # ^^ Will work on reworking this to a better solution later...
   def handle_parallel_transition(%{
     "machine" => %Machine{current_state: current_state, states: states, context: context} = machine,
     "event" => event,
@@ -656,10 +662,11 @@ defmodule Machine do
     case get_parallel_state_transition(machine, event) do # |> Cat.trace("Result of parallel_state_transition")
         {idx, _from, %Transition{to: to, from: from} = transition} ->
           # TODO: Fix the disconnect between the sequencing of whether this transition is within a parallel
-          # and the retrieval of the parallel states...
+          # and the retrieval of the parallel states... (referring to the is_list check in transition, but this may
+          # be smaller issue than I'm making it out to be.)
           parallel_states = get_parallel_states(machine)
 
-          from_state = get_from_state_struct_from_machine(machine, parallel_states, {:parallel_state, from})
+          from_state = get_from_state_struct_from_parallel_state(parallel_states, from)
           # transition |> Cat.trace("transition in the pattern match on parallel_state_transition(machine, event)")
 
           # NOTE: Implement something better than this... the part the follows after || is meant to handle cases where we're transitioning
@@ -830,23 +837,59 @@ defmodule Machine do
     |> Cat.unwrap
   end
 
+  def make_relative_transition_string_path(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}) do
+    # OLD NOTES:
+    # And allows the user of the API to specify a transition from a child state into a different parent state.
+    # If the state being transitioned to is a child state... we need to include state_name as is,
+    # OTHERWISE if it's a state at the same level as the from state, we need to use current_level_state_name
+    cond do
+      to in Utils.safe_list(sibling_states) ->
+        current_level_state_name = state_name |> String.split(".") |> Utils.remove_last |> Enum.join(".")
+        "#{current_level_state_name}.#{to}"
+      to in Utils.safe_list(child_states) ->
+        "#{state_name}.#{to}"
+      to === nil ->
+        # NOTE/TODO: Make sure this change isn't breaking anything
+        #            But this change is necessary, otherwise the "RUN_ACTIONS" case clause in handle_transitions
+        #            never executes.
+        # state_name
+        nil
+      true -> raise "ERROR: You specified a target state of '#{to}', but it isn't a sibling or child of the state that you're attempting to transition out of. Include an absolute path to target a higher level state or include the necessary sibling or child state in the statechart."
+    end
+  end
+
+  # def make_target_state_name(%{"to" => xs, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}) when is_list(xs) do
+  #   xs
+  #   |> Enum.map(fn to ->
+  #     make_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states})
+  #   end)
+  # end
   @doc """
   Strive to have unique names for top level states and child states in the statechart... otherwise I'll need to rewrite this code.
 
-  EXAMPLE USAGE:
-  get_target_state_name(%{"to" => "nested_first_step", "state_name" => state_name, "sibling_states" => ["first_step", "second_step"], "child_states" => ["nested_first_step", "to_the_right"]})
-  => "#meditative.first_step.nested_first_step"
-  %{
-    "RUN" => %Transition{
-      actions: "increment",
-      event: "RUN",
-      from: "#meditative.first_step",
-      to: "#meditative.first_step.nested_first_step"
-    }
-  }
+  EXAMPLE USAGE (This function is used when constructing transitions, and it's done recursively... so state_name will be built up during that
+  #              recursion...)
+
+  # This is the case of creating the transition string for a nested_state
+  iex> Machine.make_target_state_name(%{"to" => "nested_first_step", "state_name" => "#meditative.first_step", "sibling_states" => ["first_step", "second_step"], "child_states" => ["nested_first_step", "to_the_right"]})
+  "#meditative.first_step.nested_first_step"
+  # %{
+  #   "RUN" => %Transition{
+  #     actions: "increment",
+  #     event: "RUN",
+  #     from: "#meditative.first_step",
+  #     to: "#meditative.first_step.nested_first_step"
+  #   }
+  # }
+
+  # This is the case of creating the transition string for a sibling_state
+  iex> Machine.make_target_state_name(%{"to" => "second_step", "state_name" => "#meditative.first_step", "sibling_states" => ["first_step", "second_step"], "child_states" => ["nested_first_step", "to_the_right"]})
+  "#meditative.second_step"
+
+  ^^ the results above are due to the functionality provided via make_relative_transition_string_path/1
 
   # THIS was the state transition that I noticed was a problem, because I was outputting "#meditative.first_step.nested_first_step.to_the_right" instead (TODO: update older docs that showed a transition to of the string to the left)
-  get_target_state_name(%{"to" => "to_the_right", "state_name" => state_name, "sibling_states" => ["nested_first_step", "to_the_right"], "child_states" => ["to_the_left", "two_levels_deep_nested_step"]})
+  make_target_state_name(%{"to" => "to_the_right", "state_name" => state_name, "sibling_states" => ["nested_first_step", "to_the_right"], "child_states" => ["to_the_left", "two_levels_deep_nested_step"]})
   %{
     "SLIDE" => %Transition{
       actions: nil,
@@ -856,39 +899,66 @@ defmodule Machine do
     }
   }
   """
-  # def get_target_state_name(%{"to" => xs, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}) when is_list(xs) do
-  #   xs
-  #   |> Enum.map(fn to ->
-  #     get_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states})
-  #   end)
-  # end
-
-  def get_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}) do
+  def make_target_state_name(%{"to" => to} = x) do
     # IMMEDIATE TODO: Zenith was failing to start due to "to" being nil when String.at was called...
     # Need to refine this so that whatever the statechart interprets doesn't crash...
-    if to !== nil && String.at(to, 0) === "#" do
+    # If to is nil, nothing should be done...
+
+    # NOTE: This is why to can potentially be nil...
+    # the DSL
+    # {nil, %{"actions" => "increment_and_transition_finite_state"}}
+    # wtf is does a proper constructed transition look like
+    # %Transition{
+    #   actions: "increment_and_transition_finite_state",
+    #   event: "DO_IT",
+    #   from: "#meditative.a",
+    #   guard: nil,
+    #   to: nil
+    # }
+    # ^^ For Cases where we don't have a target state, but only run actions upon retrieval of the EVENT.
+    to
+    |> Cat.maybe
+    ~>> fn to ->
       # NOTE: This is to ensure that we have a path from #statechart_id.nested_state
-      to
-    else
-      # And allows the user of the API to specify a transition from a child state into a different parent state.
-      # If the state being transitioned to is a child state... we need to include state_name as is,
-      # OTHERWISE if it's a state at the same level as the from state, we need to use current_level_state_name
-      cond do
-        to in Utils.safe_list(sibling_states) ->
-          current_level_state_name = state_name |> String.split(".") |> Utils.remove_last |> Enum.join(".")
-          "#{current_level_state_name}.#{to}"
-        to in Utils.safe_list(child_states) ->
-          "#{state_name}.#{to}"
-        to === nil ->
-          # NOTE/TODO: Make sure this change isn't breaking anything
-          #            But this change is necessary, otherwise the "RUN_ACTIONS" case clause in handle_transitions
-          #            never executes.
-          # state_name
-          nil
-        true -> raise "ERROR: You specified a target state of '#{to}', but it isn't a sibling or child of the state that you're attempting to transition out of. Include an absolute path to target a higher level state or include the necessary sibling or child state in the statechart."
-      end
+      if String.at(to, 0) === "#" do to else make_relative_transition_string_path(x) end
     end
+    |> Cat.unwrap
   end
+
+  # LLO/TODO:
+  # Just trying to work out a good doctest for this...
+  # Keep getting state's for to and from which don't have the state_name prepended
+  @doc """
+  dsl = domain service language? Think that's the acronym.
+  # dsl_transitions = [{"to_the_left", %{"actions" => "increment", "target" => "to_the_left"}}, {"to_the_right", nil}]
+
+  Example DSL = {"to_the_left", %{"actions" => "increment", "target" => "to_the_left"}}
+
+  iex> dsl_transitions = [{"turn", nil}]
+  iex> x = %{"event" => "TO_BAR1", "child_states" => nil, "sibling_states" => ["flop", "river", "turn"]}
+  iex> Machine.construct_list_of_transitions(dsl_transitions, x, "#meditative.p.region1.foo1.flop")
+  [%Transition{actions: nil, event: "TO_BAR1", from: "#meditative.p.region1.foo1.flop", guard: nil, to: "#meditative.p.region1.foo1.turn"}]
+
+  # [%Transition{actions: "increment", event: "END_BETTING", from: "#meditative", guard: nil, to: ".to_the_left"}, %Transition{actions: nil, event: "END_BETTING", from: "#meditative", guard: nil, to: ".to_the_right"}]
+
+  """
+  def construct_list_of_transitions(dsl_transitions, %{"event" => event, "sibling_states" => sibling_states, "child_states" => child_states}, state_name) do
+    dsl_transitions
+    |> Enum.map(fn {to, rest} ->
+      Transition.new(%{
+        "event" => event,
+        "from" => state_name, # NOTE: <- I was confused as to why the result of this function was outputting strigns such as ".flop", it was because
+                              # the function inside of transition that's responsible for constructing the state names splices the string, and omits
+                              # the last string at the end of the list (i.e. attempting to get rid of the .flop from the from_state in order to
+                              # append .turn to create the to_state.)
+        "to" => make_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}),
+        "actions" => rest |> Cat.maybe ~>> fn x -> Map.get(x, "actions") end |> Cat.unwrap,
+        "guard" => rest |> Cat.maybe ~>> fn x -> Map.get(x, "guard") end |> Cat.unwrap
+      })
+    end)
+  end
+
+  def get_events_from_transitions(transitions), do: transitions |> Cat.maybe ~>> fn x -> Map.keys(x) end |> Cat.unwrap |> Utils.safe_list
 
   @doc """
   > s |> String.split(".") |> Enum.slice(0, 2)
@@ -897,9 +967,8 @@ defmodule Machine do
   ["#meditative"]
   """
   def construct_transitions(nil, _), do: nil
-  def construct_transitions(%{"transitions" => transitions, "sibling_states" => sibling_states, "child_states" => child_states}, state_name) do
-    events = transitions |> Cat.maybe ~>> fn x -> Map.keys(x) end |> Cat.unwrap |> Utils.safe_list
-    events
+  def construct_transitions(%{"transitions" => transitions, "sibling_states" => sibling_states, "child_states" => child_states} = x, state_name) do
+    get_events_from_transitions(transitions)
     |> Enum.reduce(%{}, fn (event, acc) ->
       dsl_transitions = transitions |> Map.get(event) |> extract_transition
       # NOTE: cases required to support an event having an array of transitions...
@@ -908,119 +977,249 @@ defmodule Machine do
           transition = Transition.new(%{
             "event" => event,
             "from" => state_name,
-            "to" => get_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}),
+            "to" => make_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}),
             "actions" => rest |> Cat.maybe ~>> fn x -> Map.get(x, "actions") end |> Cat.unwrap,
             "guard" => rest |> Cat.maybe ~>> fn x -> Map.get(x, "guard") end |> Cat.unwrap
           })
           # TODO: would be nice if I could curry the Map.put with event...
           acc |> Map.put(event, transition)
         xs ->
-        transitions =
-          xs
-          |> Enum.map(fn {to, rest} ->
-            Transition.new(%{
-              "event" => event,
-              "from" => state_name,
-              "to" => get_target_state_name(%{"to" => to, "state_name" => state_name, "sibling_states" => sibling_states, "child_states" => child_states}),
-              "actions" => rest |> Cat.maybe ~>> fn x -> Map.get(x, "actions") end |> Cat.unwrap,
-              "guard" => rest |> Cat.maybe ~>> fn x -> Map.get(x, "guard") end |> Cat.unwrap
-            })
-          end)
-        acc |> Map.put(event, transitions)
+          transitions = construct_list_of_transitions(xs, Map.put(x, "event", event), state_name)
+          acc |> Map.put(event, transitions)
       end
     end)
+  end
+
+  # TODO: Would really want this to raise an error if false is retrieved...
+  # but the conditionals are something else right now...
+  def confirm(true, error_lambda), do: error_lambda.()
+  def confirm(false, _), do: nil
+
+  def is_invalid_parallel_state?(keys, further_nested), do: length(keys) < 2 && (not further_nested) # length(keys) >= 2 && further_nested
+  # length(keys) < 2 && (not further_nested)
+  # true && not false <- the failure case
+
+  # true && true
+
+  # NOTE: Because map can potentially be nil... causing a runtime error.
+  def safe_get_keys_of_map(the_map), do: the_map |> Cat.maybe ~>> fn x -> Map.keys(x) end |> Cat.unwrap || []
+
+  def get_grand_child_states(parent_keys, parent_states) do
+    parent_keys
+    |> Enum.map(fn parent_key ->
+      parent_states
+      |> Cat.maybe
+      ~>> fn x -> Map.get(x, parent_key) end
+      ~>> fn x -> Map.get(x, "states") end
+      |> Cat.unwrap
+    end)
+  end
+
+  # TODO: doctest
+  def make_parallel_state_name_string_path(grand_child_states, child_state_names) do
+    # OLD NOTE:
+    # [
+    #   %{
+    #     "foo1" => %{"on" => %{"TO_FOO_2" => "foo2"}},
+    #     "foo2" => %{"on" => %{"TO_FOO_1" => "foo1"}}
+    #   },
+    #   %{"bar1" => %{"type" => "final"}, "bar2" => %{"type" => "final"}}
+    # ]
+    # 1. For each map in the grand_child_states list, need to get a list of the
+    #    state names that are keys on the map and be returned in the form of a list of lists of strings.
+    #    The result of the list below of "#{state_name}.#{x}" will need to have each of the state
+    #    names in each of the sub lists of the grand_child_states appended to each of the strings in the child names list (with
+    #    the string at index 0 having all of the strings in the sub list at index 0 appended)
+    # For example:
+    # child_states = ["#meditative.p.region1", "#meditative.p.region2"]
+    # grand_child_states = [ ["foo1", "foo2"], ["bar1"] ]
+    # result = [ ["#meditative.p.region1.foo1", "#meditative.p.region1.foo2"], ["#meditative.p.region2.bar1"] ]
+    # The result and the respective grand_child_states map at the corresponding index, will then need to be recursively
+    # passed down to create_parallel_state_names once more.
+    grand_child_states
+    |> Enum.with_index
+    |> Enum.map(fn ({m, idx}) ->
+          # Cat.trace(m, "WTF is m")
+          # WTF is m
+          # %{"bar1" => %{"type" => "final"}, "bar2" => %{"type" => "final"}}
+          # "#meditative.p.region2"
+          # WTF is child_state_names
+          # ["#meditative.p.region1", "#meditative.p.region2"]
+          # WTF is combined_state_names
+          # ["#meditative.p.region1.foo1", "#meditative.p.region1.foo2",
+          # "#meditative.p.region2.bar1", "#meditative.p.region2.bar2"]
+          # Cat.trace(child_state_names, "WTF is child_state_names")
+          child_state_name = child_state_names |> Enum.at(idx)
+          m |> Map.keys |> Enum.map(fn x -> "#{child_state_name}.#{x}" end)
+        end)
+    |> Enum.flat_map(fn x -> x end)
+  end
+
+  # TODO: Doctest.... inrelation to the context it's used in
+  def are_children_states_not_present?(child_states), do: child_states |> Enum.all?(fn x -> x === nil end)
+
+
+  @doc """
+  > s = "#meditative.p.region1.foo1"
+  "#meditative.p.region1.foo1"
+  > key = "foo1"
+  "foo1"
+  > s |> String.split(".")
+  ["#meditative", "p", "region1", "foo1"]
+  > s |> String.split(".") |> Enum.at(-1) === key
+  true
+
+  iex> xs = ["#meditative.p.region1.foo1", "#meditative.p.region1.foo2", "#meditative.p.region2.bar1", "#meditative.p.region2.bar2"]
+  iex> Machine.get_full_state_string_path_with_child_finite_state_string(xs, "foo1")
+  "#meditative.p.region1.foo1"
+  """
+  def get_full_state_string_path_with_child_finite_state_string(xs, key) do
+    xs |> Enum.filter(fn x -> x |> String.split(".") |> Enum.at(-1) === key end) |> Enum.at(0)
+  end
+
+  def make_intermediate_state_representation_from_dsl_with_possible_child_states(grand_child_states, combined_state_names) do
+    # The grand_child_states the first arg of make_intermediate_state_representation_from_dsl_with_possible_child_states
+    # [
+    #   %{
+    #     "foo1" => %{
+    #       "on" => %{"GTFO" => "#meditative.first_step", "TO_FOO_2" => "foo2"},
+    #       "states" => %{
+    #         "flop" => %{"on" => %{"END_BETTING" => "turn"}},
+    #         "river" => %{"type" => "final"},
+    #         "turn" => %{"on" => %{"END_BETTING" => "river"}}
+    #       }
+    #     },
+    #     "foo2" => %{"on" => %{"TO_FOO_1" => "foo1"}}
+    #   },
+    #   %{"bar1" => %{"type" => "final"}, "bar2" => %{"type" => "final"}}
+    # ]
+    # The combined_state_names the second arg of make_intermediate_state_representation_from_dsl_with_possible_child_states
+    # ["#meditative.p.region1.foo1", "#meditative.p.region1.foo2",
+    #  "#meditative.p.region2.bar1", "#meditative.p.region2.bar2"]
+
+    grand_child_states
+    |> Enum.map(fn m ->
+        m
+        |> Cat.maybe
+        ~>> fn x -> Map.keys(x) end
+        # keys = ["foo1", "foo2"]
+        ~>> (fn keys -> keys |> Enum.map(fn key ->  {key, Map.get(m, key)} end) end)
+        # ~>> fn x -> Cat.trace(x, "{key, map.get(m, key)") end
+        # ~>> fn xs -> Cat.trace(xs, "WTF is going into the line that I'm attempting to interpret...") end
+        # [
+        #   %{
+        #       "on" => %{"GTFO" => "#meditative.first_step", "TO_FOO_2" => "foo2"},
+        #       "states" => %{
+        #         "flop" => %{"on" => %{"END_BETTING" => "turn"}},
+        #         "river" => %{"type" => "final"},
+        #         "turn" => %{"on" => %{"END_BETTING" => "river"}}
+        #       }
+        #    },
+        #    %{"on" => %{"TO_FOO_1" => "foo1"}}
+        # ]
+        ~>> (fn xs ->
+            # WTF is combined_state_names result
+            # ["#meditative.p.region1.foo1", "#meditative.p.region1.foo2",
+            #   "#meditative.p.region2.bar1", "#meditative.p.region2.bar2"]
+            # combined_state_names |> Enum.at(idx) <- introduces yet another disconnect...
+            # IMPORTANT NOTE: As there's some amount of coordination which should take place between make_parallel_state_name_string_path/2 and the line below
+            # "states" => %{
+            #   "flop" => %{"on" => %{"END_BETTING" => "turn"}},
+            #   "river" => %{"type" => "final"},
+            #   "turn" => %{"on" => %{"END_BETTING" => "river"}}
+            # }
+            xs
+            |> Enum.map(fn {key, %{"states" => states}} -> {get_full_state_string_path_with_child_finite_state_string(combined_state_names, key), states}
+                          {key, _} -> {get_full_state_string_path_with_child_finite_state_string(combined_state_names, key), nil}
+            end)
+          end)
+        |> Cat.unwrap
+      end)
+
+      # [
+      #   [
+      #     {"#meditative.p.region1.foo1",
+      #      %{
+      #        "flop" => %{"on" => %{"END_BETTING" => "turn"}},
+      #        "river" => %{"type" => "final"},
+      #        "turn" => %{"on" => %{"END_BETTING" => "river"}}
+      #      }},
+      #     {"#meditative.p.region1.foo1", nil}
+      #   ],
+      #   [{"#meditative.p.region1.foo2", nil}, {"#meditative.p.region1.foo2", nil}]
+      # ]
+      # ^^ This is an erroneous result... The states for bar1 and bar2 aren't being represented.
+
+      # The actual correct result... (surprisingly all tests still pass with that change)
+      # [
+      #   [
+      #     {"#meditative.p.region1.foo1",
+      #      %{
+      #        "flop" => %{"on" => %{"END_BETTING" => "turn"}},
+      #        "river" => %{"type" => "final"},
+      #        "turn" => %{"on" => %{"END_BETTING" => "river"}}
+      #      }},
+      #     {"#meditative.p.region1.foo2", nil}
+      #   ],
+      #   [{"#meditative.p.region2.bar1", nil}, {"#meditative.p.region2.bar2", nil}]
+      # ]
+  end
+
+  @doc """
+  TODO: Make sure that the output of this function actually has an impact on the parallel state feature...
+        Seems more like it's just creating state path strings for children states...
+
+  iex> xs = [
+  iex>  [
+  iex>    {"#meditative.p.region1.foo1",
+  iex>      %{
+  iex>        "flop" => %{"on" => %{"END_BETTING" => "turn"}},
+  iex>        "river" => %{"type" => "final"},
+  iex>        "turn" => %{"on" => %{"END_BETTING" => "river"}}
+  iex>      }},
+  iex>    {"#meditative.p.region1.foo2", nil}
+  iex>  ],
+  iex>  [{"#meditative.p.region2.bar1", nil}, {"#meditative.p.region2.bar2", nil}]
+  iex> ]
+  iex> Machine.make_parallel_state_names_from_intermediate_state_representation(xs)
+  [["#meditative.p.region1.foo1.flop", "#meditative.p.region1.foo1.river", "#meditative.p.region1.foo1.turn"], [], [], []]
+  """
+  def make_parallel_state_names_from_intermediate_state_representation(xs) do
+    xs
+    |> Enum.map(fn xs ->
+      xs
+      |> Enum.map(fn ({next_state_name, further_nested_states}) ->
+        {next_state_name, further_nested_states} # |> Cat.trace("{next_state_name, further_nested_states} in side the map")
+        create_parallel_state_names(%{
+          "state_name" => next_state_name,
+          "child_states" => further_nested_states
+        }, true)
+      end)
+    end)
+    |> Enum.flat_map(fn x -> x end)
   end
 
   def create_parallel_state_names(%{
     "state_name" => state_name,
     "child_states" => child_states
   }, further_nested \\ false) do
-    keys = child_states |> Cat.maybe ~>> fn x -> Map.keys(x) end |> Cat.unwrap || []
+    keys = safe_get_keys_of_map(child_states)
 
-    if further_nested do child_states end
-    if keys |> length < 2 && (not further_nested) do
-      raise "ERROR: You specified #{state_name} to be a parallel state, but did not provide 2 or more sub states for it."
+    is_invalid_parallel_state?(keys, further_nested)
+    |> confirm(fn -> raise "ERROR: You specified #{state_name} to be a parallel state, but did not provide 2 or more sub states for it." end)
+
+    grand_child_states = get_grand_child_states(keys, child_states)
+    child_state_names = keys |> Enum.map(fn x -> "#{state_name}.#{x}" end)
+
+    if are_children_states_not_present?(grand_child_states) do
+      child_state_names
     else
-      grand_child_states =
-        keys
-        |> Enum.map(fn x ->
-          child_states
-          |> Cat.maybe
-          ~>> fn y -> Map.get(y, x) end
-          ~>> fn y -> Map.get(y, "states") end
-          |> Cat.unwrap
-        end)
+      combined_state_names = make_parallel_state_name_string_path(grand_child_states, child_state_names) #  |> Cat.trace("WTF is combined_state_names result")
+      result =
+        make_intermediate_state_representation_from_dsl_with_possible_child_states(grand_child_states, combined_state_names)
+        |> make_parallel_state_names_from_intermediate_state_representation()
 
-        # IMMEDIATE LLO:
-        # [
-        #   %{
-        #     "foo1" => %{"on" => %{"TO_FOO_2" => "foo2"}},
-        #     "foo2" => %{"on" => %{"TO_FOO_1" => "foo1"}}
-        #   },
-        #   %{"bar1" => %{"type" => "final"}, "bar2" => %{"type" => "final"}}
-        # ]
-        # 1. For each map in the grand_child_states list, need to get a list of the
-        #    state names that are keys on the map and be returned in the form of a list of lists of strings.
-        #    The result of the list below of "#{state_name}.#{x}" will need to have each of the state
-        #    names in each of the sub lists of the grand_child_states appended to each of the strings in the child names list (with
-        #    the string at index 0 having all of the strings in the sub list at index 0 appended)
-        # For example:
-        # child_states = ["#meditative.p.region1", "#meditative.p.region2"]
-        # grand_child_states = [ ["foo1", "foo2"], ["bar1"] ]
-        # result = [ ["#meditative.p.region1.foo1", "#meditative.p.region1.foo2"], ["#meditative.p.region2.bar1"] ]
-        # The result and the respective grand_child_states map at the corresponding index, will then need to be recursively
-        # passed down to create_parallel_state_names once more.
-
-        # NOTE: How will the transition names be handled?... for example "TOO_FOO_2"'s "foo2", should we be appending it with the child_state "#meditative.p.region1" name?
-        #       or will the construct_transition function handle creating the appropriate state path?
-      child_state_names = keys |> Enum.map(fn x -> "#{state_name}.#{x}" end)
-
-      if grand_child_states |> Enum.all?(fn x -> x === nil end) do
-        child_state_names
-      else
-        combined_state_names =
-          grand_child_states
-          |> Enum.with_index
-          |> Enum.map(fn ({m, idx}) ->
-                child_state_name = child_state_names |> Enum.at(idx)
-                m |> Map.keys |> Enum.map(fn x -> "#{child_state_name}.#{x}" end)
-              end)
-          |> Enum.flat_map(fn x -> x end)
-
-        # if (further_nested) do combined_state_names |> Cat.trace("nested combined_state_names") end
-
-        result =
-          grand_child_states
-          |> Enum.with_index
-          |> Enum.map(fn ({m, idx}) ->
-              m
-              |> Cat.maybe
-              ~>> fn x -> Map.keys(x) end
-              ~>> (fn keys -> keys |> Enum.map(fn key -> m |> Map.get(key) end) end)
-              ~>> (fn xs ->
-                  xs
-                  |> Enum.map(fn %{"states" => states} -> {combined_state_names |> Enum.at(idx), states}
-                                _ -> {combined_state_names |> Enum.at(idx), nil}
-                  end)
-                end)
-              |> Cat.unwrap
-            end)
-          # |> Cat.trace("RESULT OF {next_state_name, further_nested_states}")
-          |> Enum.map(fn xs ->
-            xs
-            |> Enum.map(fn ({next_state_name, further_nested_states}) ->
-              {next_state_name, further_nested_states} # |> Cat.trace("{next_state_name, further_nested_states} in side the map")
-              create_parallel_state_names(%{
-                "state_name" => next_state_name,
-                "child_states" => further_nested_states
-              }, true)
-            end)
-          end)
-          |> Enum.flat_map(fn x -> x end)
-          # |> Cat.trace("RESULT OF further_nested create_parallel_state_names")
-
-          [combined_state_names | result]
-      end
+        [combined_state_names | result]
     end
   end
 
@@ -1030,8 +1229,12 @@ defmodule Machine do
   # I know this works for at least first level states that hacve invoke....
   # TODO: Need to ensure that this can work for nested states.
   #       And then parallel states whenever that is gotten to.
+  # NOTE: The pattern matches on "#" <> to in the function head are to detect when the user has specified an absolute state string
+  #       path in order to transition to an ancestor state rather than a sibling state.
+  def convert_on_done_on_error(%{"to" => "#" <> _ = to }, _), do: to
   def convert_on_done_on_error(%{"to" => to } = rest, name), do:
     %{rest | "to" => "#{name |> String.split(".") |> Enum.drop(-1) |> Enum.join(".")}.#{to}"}
+  def convert_on_done_on_error("#" <> _ = to, _) when is_binary(to), do: to
   def convert_on_done_on_error(to, name) when is_binary(to), do:
     "#{name |> String.split(".") |> Enum.drop(-1) |> Enum.join(".")}.#{to}"
 
@@ -1143,6 +1346,8 @@ defmodule Machine do
 
   TODO/LLO:
   Now to just get it so that Transitions reflect the proper level keys for from and to states...
+
+  NOTE: This function is recursive, but not tail recursive... But it would be if it weren't for supporting the parallel state feature.
   """
   def construct_states(states, level, acc \\ []) do
     state_names = states |> Cat.maybe ~>> (&Map.keys/1) |> Cat.unwrap
@@ -1244,8 +1449,11 @@ defmodule Machine do
           # THEN... you need to have a different mode of execution for transactions if it's the case that the current_state is a list...
           # hopefully the refactored transition function is amenable to implementing this change.
           type = state |> Map.get("type")
+
+          # TODO: Use the Either concept... if it's type parallel, put the state in a Left, otherwise, put the state in a Right,
+          # Implement separate functions which can be doctested, and provide them as the functions to either/2 for the branching logic.
           if type === "parallel" do
-            # para
+            # TODO: Create a separate function and doctest what the goal of the below line is...
             parallel_state_names = child_states |> Cat.maybe ~>> fn m -> Map.keys(m) end ~>> fn keys -> Enum.map(keys, fn key -> "#{name}.#{key}"end) end |> Cat.unwrap || [name]
             # parallel_state_names # |> Cat.trace("WTF is parallel_state_names")
             create_parallel_state_names(%{
@@ -1262,7 +1470,7 @@ defmodule Machine do
               "on_exit" => state |> Map.get("on_exit"),
               "type" => type,
               "parallel_states" => %{
-                "parallel_state_names" => parallel_state_names, # TODO/NOTE: Don't thinmkl the names created vcia create_parallel_state_names are necessary... ++ names,
+                "parallel_state_names" => parallel_state_names, # TODO/NOTE: Don't think the names created vcia create_parallel_state_names are necessary... ++ names,
                 "states" => construct_states(child_states, name, [{name, state} | acc])  |> Utils.to_map
               },
               # "invoke" => state |> Map.get("invoke"), TODO: To be supported after a later refactor.

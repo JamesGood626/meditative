@@ -23,6 +23,40 @@ defmodule MeditativeTest do
     guards = %{
       "retries_not_exceeded" => fn context -> Map.get(context, "count") < 3 end
     }
+
+    statechart_with_invoke_feature = %{
+      "id" => "meditative",
+      "initial_state" => "a",
+      "context" => %{
+        "count" => 0
+      },
+      "states" => %{
+        "a" => %{
+          "on" => %{ "DO_IT" => "d" }
+        },
+        "b" => %{
+          "on" => %{ "DO_IT" => "c" }
+        },
+        "c" => %{
+          "on" => %{ "DO_IT" => "c" }
+        },
+        "d" => %{
+          "invoke" => %{
+            "id" => "c_invoke_src",
+            "src" => "c_invoke_src_func",
+            "on_done" => "b",
+            "on_error" => "c",
+          }
+        }
+      }
+    }
+
+    invoke_sources = %{
+      "c_invoke_src_func" => fn context ->
+        {:ok, %{"data" => "Http response"}}
+      end
+    }
+
     statechart = %{
       "id" => "meditative",
       "initial_state" => "p",
@@ -371,7 +405,7 @@ defmodule MeditativeTest do
       }
     }
 
-    %{statechart: statechart, interpreted_statechart: interpreted_statechart, actions: actions, guards: guards}
+    %{statechart: statechart, interpreted_statechart: interpreted_statechart, statechart_with_invoke_feature: statechart_with_invoke_feature, invoke_sources: invoke_sources, actions: actions, guards: guards}
   end
 
   test "Machine supports events for which the transition has no target finite state, but only runs actions", %{statechart: statechart, actions: actions, guards: guards} do
@@ -519,13 +553,33 @@ defmodule MeditativeTest do
     assert state_after_second_transition === "#meditative.b" # NOTE: it didn't transition.. which is the desired behavior.
   end
 
-  test "Meditative statecharts support the invoke feature" do
+  test "Meditative statecharts support the invoke feature for top level states and successfully transitions to the specified on_done state", %{statechart_with_invoke_feature: statechart_with_invoke_feature, invoke_sources: invoke_sources}  do
+    machine = Meditative.interpret(statechart_with_invoke_feature, %{"actions" => nil, "guards" => nil, "invoke_sources" => invoke_sources})
+    state_before_transition = machine |> Map.get(:current_state)
+    updated_machine = Meditative.transition(machine, "DO_IT")
+    state_after_transition = updated_machine |> Map.get(:current_state)
+
+    assert state_before_transition === "#meditative.a"
+    assert state_after_transition === "#meditative.b"
+  end
+
+  test "Meditative statecharts support the invoke feature for top level states and successfully transitions to the specified on_error state", %{statechart_with_invoke_feature: statechart_with_invoke_feature}  do
     invoke_sources = %{
       "c_invoke_src_func" => fn context ->
-        {:ok, %{"data" => "Http response"}}
+        {:error, %{"data" => "Http response was a bust..."}}
       end
     }
 
+    machine = Meditative.interpret(statechart_with_invoke_feature, %{"actions" => nil, "guards" => nil, "invoke_sources" => invoke_sources})
+    state_before_transition = machine |> Map.get(:current_state)
+    updated_machine = Meditative.transition(machine, "DO_IT")
+    state_after_transition = updated_machine |> Map.get(:current_state)
+
+    assert state_before_transition === "#meditative.a"
+    assert state_after_transition === "#meditative.c"
+  end
+
+  test "Meditative statecharts support the invoke feature for nested states", %{invoke_sources: invoke_sources} do
     statechart = %{
       "id" => "meditative",
       "initial_state" => "a",
@@ -534,22 +588,21 @@ defmodule MeditativeTest do
       },
       "states" => %{
         "a" => %{
-          "on" => %{ "DO_IT" => "d" }
+          "on" => %{ "DO_IT" => "#meditative.b.c" }
         },
         "b" => %{
-          "on" => %{ "DO_IT" => "c" }
-        },
-        "c" => %{
-          "on" => %{ "DO_IT" => "c" }
-        },
-        "d" => %{
-          "invoke" => %{
-            "id" => "c_invoke_src",
-            "src" => "c_invoke_src_func",
-            "on_done" => "b",
-            "on_error" => "c",
+          "states" => %{
+            "c" => %{
+              "invoke" => %{
+                "id" => "c_invoke_src",
+                "src" => "c_invoke_src_func",
+                "on_done" => "#meditative.d",
+                "on_error" => "#meditative.a",
+              }
+            },
           }
-        }
+        },
+        "d" => %{ "type" => "final" }
       }
     }
 
@@ -559,6 +612,6 @@ defmodule MeditativeTest do
     state_after_transition = updated_machine |> Map.get(:current_state)
 
     assert state_before_transition === "#meditative.a"
-    assert state_after_transition === "#meditative.b"
+    assert state_after_transition === "#meditative.d"
   end
 end
