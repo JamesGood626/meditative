@@ -6,6 +6,11 @@ defmodule Machine do
 
   defstruct [:id, :current_state, :parallel_state_key, :context, :on, :states, :actions, :guards, :invoke_sources]
 
+  # IMMEDIATE TODO STEPS FOR COMPLETING THE THIRD REFACTOR OF THE TRANSITION SEQUENCING IMPLEMENTATION:
+  # 1. Refactor def transition (w/ the changes that require implementing a list of functions to be executed in a reduce)
+  # 2. Refactor def handle_transition (and a lot of the functions used inside of it (which should instead return a
+  #    updated_machine... apply_actions and apply_transient_transition for example))
+
   # THis comment (in the nature of Software Architecture)...
   # https://www.reddit.com/r/elixir/comments/np688d/why_is_there_no_need_for_asyncawait_in_elixir/h03pttm?utm_source=share&utm_medium=web2x&context=3
 
@@ -284,7 +289,7 @@ defmodule Machine do
     invoke_guard(%{"machine" => machine, "guard" => guard, "context" => context})
   end
 
-  def run_on_exit(%{"state" => state, "actions" => actions, "machine" => machine, "context" => context,  "event" => event}) do
+  def run_on_exit(%{"state" => state, "machine" => machine, "context" => context, "event" => event}) do
     state
     |> get_on_exit
     |> Utils.to_list
@@ -293,7 +298,7 @@ defmodule Machine do
     end)
   end
 
-  def run_on_entry(%{"state" => state, "actions" => actions, "machine" => machine, "context" => context,  "event" => event}) do
+  def run_on_entry(%{"state" => state, "machine" => machine, "context" => context, "event" => event}) do
     state
     |> get_on_entry
     |> Utils.to_list
@@ -315,7 +320,53 @@ defmodule Machine do
     "state" => state,
     "fallback_to" => fallback_to
     }) do
-      get_target_state_struct_via_transition(transition, states)
+      # IMMEDIATE TODO:
+
+      # Overall state available to the pipeline (All functions receive this as input and return it as output (wrapped in a Right/Left)):
+      # %{
+      #   "machine" => machine,
+      #   "transition" => transition
+      # }
+
+      # Actions of a Transient Transition:
+      # [
+      #   {"GET_TRANSIENT_TRANSITION", get_transient_transition_fn}, Needs machine <- If nil, then short circuit rest of the steps (if a Left(OverallState) is returned)
+      #   {"GET_TARGET_STATE", get_target_state_fn}, Needs machine and transition
+      #   {"GET_AND_RUN_GUARDS", get_and_run_guards_fn}, Needs transition to retrieve guard from,
+      #   {"GET_AND_RUN_ACTIONS", get_and_run_actions_fn}, Needs transition to retrieve actions from
+      #   {"RUN_ON_EXIT", run_on_exit}, Needs machine_state, machine, new_context (from running actions), and event
+      #   {"RUN_ON_ENTRY", run_on_entry} Needs machine_state, machine, new_context (from running actions), and event
+      # ]
+
+      # IMPORANT NOTE:
+      # After further analysing the potential structure of the necessary pipelines
+      # I realize that these steps listed in def handle_transition... can really be applied to a transient transition
+      # as well.
+      # So Both a transient_transition and invoke_sources can trigger a transition...
+      # All they need to do is call the transition function (w/ the exception that the invoke_sources will require a new
+      # function head for def transition to support the particular event data structure that's returned by executing a invoke_source)
+      # ThePipeline:
+        # [
+          #   {"GET_AND_RUN_ACTIONS", get_and_run_actions_fn} Needs machine and transition (should return Right(updated_machine)) Shouldn't ever be a failure case...
+          #   {"CHECK_IF_TRANSITION_HAS_TARGET_STATE", transition_has_to?}, <- Return Left(machine) to short circuit... as there is no finite state transition to handle.
+          #   {"RUN_ON_EXIT", run_on_exit}, Needs machine_state, machine, new_context (from running actions), and event
+          #   {"RUN_ON_ENTRY", run_on_entry} Needs machine_state, machine, new_context (from running actions), and event
+          #   {"GET_AND_RUN_TRANSIENT_TRANSITION", get_and_run_transient_transition_fn} Should return Right(updated_machine) || Right(unmodified_machine)
+          #   {"EXECUTE_INVOKE_SOURCES"} Needs machine
+        # ]
+        # ^^ And really checking for a transient_transition || invoke_sources should really be the last step...
+        #    as only one should be present at any given time.
+
+      # IMPORTANT_NOTE
+      # Due to this pipeline being used in the handle_transition function's pipeline (that I'm sketching out currently..)
+      # It's necessary to ultimately return a Right(unmodified_machine) || Right(updated_machine) as the overall return result from this function.
+      # So Whether the result of the pipeline above is Right || Left (in the event that we needed to short circuit), <- that result should
+      # have its machine extracted and wrapped in a Right.
+
+      # ^^ Double check on what the output of this should be for both successful cases and failure cases in relation to the process that
+      #    invokes this as some part of an action pipeline...
+      # Success case return should be Right(Machine with updated current_state and context)?
+      # Failure case return should be Left(Machine unmodified)?
     target_state = get_target_state_struct_via_transition(transition, states)
     case {transition, run_cond(%{"machine" => machine, "guard" => get_guard(transition), "context" => context})} do
       {%Transition{to: to, actions: actions}, true} ->
@@ -326,9 +377,11 @@ defmodule Machine do
           "event" => event
         })
         # Return an updated Machine Struct with updated finite and context state.
-        new_context = run_on_exit(%{"state" => state, "actions" => actions, "machine" => machine, "context" => new_context, "event" => event})
-        new_context = run_on_entry(%{"state" => target_state, "actions" => actions, "machine" => machine, "context" => new_context, "event" => event})
+        new_context = run_on_exit(%{"state" => state, "machine" => machine, "context" => new_context, "event" => event})
+        new_context = run_on_entry(%{"state" => target_state, "machine" => machine, "context" => new_context, "event" => event})
         %{"new_context" => new_context, "to" => to}
+      # vv Is this below case ever actually possible? This function shouldn't even be executing if a transition struct wasn't retrieved while looking
+      # up an event = "" under a machine's transitions map.
       {_, false} ->
         %{"new_context" => context, "to" => fallback_to}
     end
@@ -440,8 +493,27 @@ defmodule Machine do
   end
 
   def handle_executing_invoke_sources(machine, context, state) do
-    # IO.puts("the state")
-    # IO.inspect(state)
+    fn %{"id" => id, "src" => src, "on_done" => on_done, "on_error" => on_error} ->
+      # 1. Grab the invoke function from the Machine struct under :invoke_sources via the src string
+      # 2. Invoke the lambda function which was retrieved via the src string
+      invoke_source_fn = machine |> Cat.maybe ~>> fn x -> Map.get(x, :invoke_sources) end ~>> fn x -> Map.get(x, src) end |> Cat.unwrap
+
+      if invoke_source_fn === nil || !is_function(invoke_source_fn) do
+        raise "DEVELOPER ERROR: the function provided for the invoke src #{src} under state #{state} is not a function."
+      end
+
+      task = Task.async(fn -> invoke_source_fn.(context) end)
+      case Task.await(task) do
+        # {transition_struct, event}
+        {:ok, data} ->
+          {on_done, %{"type" => "INVOKE_SOURCE_ON_DONE_TRANSITION", "invoke_id" => id, "payload" => data}}
+        {:error, data} ->
+          {on_error, %{"type" => "INVOKE_SOURCE_ON_ERROR_TRANSITION", "invoke_id" => id, "payload" => data}}
+      end
+    end
+  end
+
+  def execute_invoke_sources(machine, context, state) do
     # NOTE/FUTURE TODO: "#meditative.p.region1.foo2" <- The Map.get(state) below will return nil... because
     # it's a parallel state. Will need to fix this once I handle the refactor...
 
@@ -451,24 +523,7 @@ defmodule Machine do
       |> Map.get(state)
       |> Cat.maybe
       ~>> fn x -> Map.get(x, :invoke) end
-      ~>> fn %{"id" => id, "src" => src, "on_done" => on_done, "on_error" => on_error} ->
-        # 1. Grab the invoke function from the Machine struct under :invoke_sources via the src string
-        # 2. Invoke the lambda function which was retrieved via the src string
-        invoke_source_fn = machine |> Cat.maybe ~>> fn x -> Map.get(x, :invoke_sources) end ~>> fn x -> Map.get(x, src) end |> Cat.unwrap
-
-        if invoke_source_fn === nil || !is_function(invoke_source_fn) do
-          raise "DEVELOPER ERROR: the function provided for the invoke src #{src} under state #{state} is not a function."
-        end
-
-        task = Task.async(fn -> invoke_source_fn.(context) end)
-        case Task.await(task) do
-          # {transition_struct, event}
-          {:ok, data} ->
-            {on_done, %{"type" => "INVOKE_SOURCE_ON_DONE_TRANSITION", "invoke_id" => id, "payload" => data}}
-          {:error, data} ->
-            {on_error, %{"type" => "INVOKE_SOURCE_ON_ERROR_TRANSITION", "invoke_id" => id, "payload" => data}}
-        end
-      end
+      ~>> handle_executing_invoke_sources(machine, context, state)
       |> Cat.unwrap
 
     case result do
@@ -488,23 +543,62 @@ defmodule Machine do
     "target_state" => target_state, # Needs to be a State struct
   }) do
     case next_step do
+      # [
+      #  {"RUN_ACTIONS", {machine, actions, context, event}},
+      #  {"RUN_ON_EXIT", {machine, actions, updated_context, event}},
+      #  {"RUN_ON_ENTRY", {machine, actions, updated_context2, event}},
+      #  {"RUN_ON_TRANSIENT_TRANSITION", {machine, updated_context, event = "", states, from_state, fallback_to_state}},
+      # ^^vv NOTE: "RUN_ON_TRANSIENT_TRANSITION" and "RUN_INVOKE_SOURCES" are not permissible simultaneously.
+      #  {"RUN_INVOKE_SOURCES", }
+      # ]
+      # ^^ IMMEDIATE TODO: The list which should be passed to this function AFTER handling the third refactor of the transition logic...
+      #    Where the above list is generated by the handle_normal_transition and handle_parallel_transition functions.
+      # I think the easiest way to implement this would be to have functions (standardized to handle a particular input/output)
+      # which are specified in the desired order (in a list) in which they should run, and composed at runtime (kind of like the
+      # SDfF book). <- Although that may just be overkill... and instead you can just opt for a regular |> pipeline.
       {"TRANSITION", %Transition{to: to, actions: actions}} ->
         # TODO: Had to pattern match on the tuple after adding the actions can return a tuple to trigger a transition feature...
         #       would be better if I create a function that only retrieves a new_context back if it's a regular transition we're executing
         #       otherwise get a tuple back if it's the actions feature.
+
+        # IMMEDIATE TODO:
+        # Another pipeline... (after having noted out the pipeline in apply_transient_transition; the two pipeline needs to be compatible)
+        # OverallState = %{
+        #   "machine" => machine,
+        #   "event" => event,
+        #   "transition" => transition,
+        # }
+
+        # ThePipeline:
+        # [
+          #   {"GET_AND_RUN_ACTIONS", get_and_run_actions_fn} Needs machine and transition (should return Right(updated_machine)) Shouldn't ever be a failure case...
+          #   {"CHECK_IF_TRANSITION_HAS_TARGET_STATE", transition_has_to?}, <- Return Left(machine) to short circuit... as there is no finite state transition to handle.
+          #   {"RUN_ON_EXIT", run_on_exit}, Needs machine_state, machine, new_context (from running actions), and event
+          #   {"RUN_ON_ENTRY", run_on_entry} Needs machine_state, machine, new_context (from running actions), and event
+          #   {"GET_AND_RUN_TRANSIENT_TRANSITION", get_and_run_transient_transition_fn} Should return Right(updated_machine) || Right(unmodified_machine)
+          #   {"EXECUTE_INVOKE_SOURCES"} Needs machine
+        # ]
+
+        # IMMEDIATE TODO:
+        # Refactor apply_actions to return the machine with the updated_context after running actions
         {_, new_context} = apply_actions(%{
           "machine" => machine,
           "actions" => actions,
           "context" => context,
           "event" => event
         })
+
+        # IMMEDIATE TODO:
+        # Refactor run_on_exit && run_on_entry to return the machine with the updated_context after running actions
         # Return an updated Machine Struct with updated finite and context state.
-        new_context = run_on_exit(%{"state" => from_state, "actions" => actions, "machine" => machine, "context" => new_context,  "event" => event})
-        new_context = run_on_entry(%{"state" => target_state, "actions" => actions, "machine" => machine, "context" => new_context,  "event" => event})
+        new_context = run_on_exit(%{"state" => from_state, "machine" => machine, "context" => new_context, "event" => event})
+        new_context = run_on_entry(%{"state" => target_state, "machine" => machine, "context" => new_context, "event" => event})
+
+        # NOTE: target_state is set on the OverallState (within the handle_normal_transition && handle_parallel_transition functions)
         transient_transition = target_state |> get_transition_associated_with_event(%{
           "event" => "",
           "machine" => machine,
-          "context" => context
+          "context" => new_context # <- Why didn't I pass in new_context here? context or new_context... either don't break tests
         })
         %{"new_context" => new_context, "to" => to} =
               apply_transient_transition(%{"machine" => machine, "transition" => transient_transition, "context" => new_context, "event" => event, "states" => states, "state" => from_state, "fallback_to" => to})
@@ -548,8 +642,32 @@ defmodule Machine do
         # So we need to retrieve the target_state that will be set to the current_state below, and then check if there's
         # any registered invoke source, if so then we go through the process outlined above, and potentially transitioning
         # to the states declared on the onDone/onError keys.
+
+        # vv TODO: Make sure the reason you chose to access :initial_state within the monad context below
+        # is because you want to make sure that if an initial_state is present in the state which is being transitioned to
+        # that we update the machine's current_state to that value, and if not then we just set it as the state assigned under
+        # the Transition struct's 'to' key. (If this is the case, then create a single function for this and doctest it)
+        # .WTF is target_state before execute_invoke_sources
+        # %State{
+        #   initial_state: nil,
+        #   invoke: nil,
+        #   name: "#meditative.p.region1.foo2",
+        #   on: %{
+        #     "TO_FOO_1" => %Transition{
+        #       actions: nil,
+        #       event: "TO_FOO_1",
+        #       from: "#meditative.p.region1.foo2",
+        #       guard: nil,
+        #       to: "#meditative.p.region1.foo1"
+        #     }
+        #   },
+        #   on_entry: nil,
+        #   on_exit: nil,
+        #   parallel_states: nil,
+        #   type: nil
+        # }
         ending_state = target_state |> Cat.maybe ~>> fn x -> Map.get(x, :initial_state) end |> Cat.unwrap || to
-        case handle_executing_invoke_sources(machine, new_context, ending_state) do
+        case execute_invoke_sources(machine, new_context, ending_state) do
           :no_invoke ->
             %{machine | current_state: ending_state, context: new_context}
 
@@ -717,6 +835,22 @@ defmodule Machine do
     "machine" => %Machine{states: states, context: context} = machine,
     "event" => event
   }) do
+    # IMMEDIATE TODO
+    # PipelineOverallState = %{
+    #   "machine" => machine,
+    #   "event" => event,
+    #   "from_state" => from_state, # :: %State{} Placed on state via the get_from_state_struct_from_machine function
+    #   "target_state" => target_state, # :: %State{} Placed on state via the get_target_state_struct_via_transition function
+    #   "transition" => transition, # %Transition{} Placed on state via the get_transition_associated_with_event function
+    # }
+
+    # ^^ Doing this... Along with the other Pipeline functions in the lower levels, should make the determine_next_transition_step/1 function redundant.
+    # This is less similar to the other pipelines I've sketched out..
+    # The structure of what needs to occur is more along the lines of reducing over a list of functions
+    # (which each use the acc value to fetch the value needed and return the acc value updated with whatever they retrieved;
+    # AND ultimately... the last function in the pipeline will return the machine updated after the transition steps have occured)
+
+
       # NOTE: Doing a normal state transition
       # do_normal_state_transition(%{
       #   "machine" => machine,
@@ -777,7 +911,7 @@ defmodule Machine do
   # TODO:
   # event can be either a string or a map which stores the string under the key :type + any arbitrary key the user wants to use
   # to establish some kind of additional metadata for the transition.
-  def transition(%Machine{current_state: current_state} = machine, event) do
+  def transition(%Machine{current_state: current_state} = machine, event) when is_list(current_state), do: handle_parallel_transition(%{"machine" => machine, "event" => event})
     # 1. Retrieve current_state from machine
     # current_state = machine |> Map.get("current_state") |> IO.inspect
     #   1a.
@@ -791,14 +925,17 @@ defmodule Machine do
     # transition -> (handle_transition, parallel_state_transition, determine_next_transition_step, get_transition_associated_with_event, get_target_state, get_state, get_guard, run_cond)
     #            -> is_parallel_state? (true)  -> parallel_state_transition -> (get_state, get_guard, determine_next_transition_step) -> transitioning_to_another_parallel_state
     #                                  (false) -> normal_state_transition ->                                                                                                                          -> transitioning_out_of_the_parallel_state
-
-    if is_list(current_state) do
-      # transition parallel state...
-      handle_parallel_transition(%{"machine" => machine, "event" => event})
-    else
-      handle_normal_transition(%{"machine" => machine, "event" => event})
-    end
-  end
+  #   if is_list(current_state) do
+  #     handle_parallel_transition(%{"machine" => machine, "event" => event})
+  #   else
+  #     handle_normal_transition(%{"machine" => machine, "event" => event})
+  #   end
+  # end
+  def transition(%Machine{} = machine, event), do: handle_normal_transition(%{"machine" => machine, "event" => event})
+  # IMMEDIATE TODO:
+  # If I go through with the third refactor of the transition logic... then you'll need to have another transition function head
+  # to support handling a transition when provided with the output of the handle_execute_invoke_sources function:
+  # {%{"target" => to} = transition_map, next_event}} || {to :: String, next_event}
 
   def new(%{
     # "initial_state" => initial_state,
