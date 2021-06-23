@@ -634,6 +634,7 @@ defmodule MeditativeTest do
         "b" => %{ "type" => "final" }
       }
     }
+    # blah
 
     actions = %{
       "increment" => fn (%{"count" => count}, event) -> {nil, %{"count" => count + 1}} end

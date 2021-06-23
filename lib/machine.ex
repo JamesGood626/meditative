@@ -887,6 +887,7 @@ defmodule Machine do
       #          a specific finite state's 'on' transition map. event: #{event} current_state: #{current_state}"
       # end
 
+      # blah
       # IMPORTANT NOTE/TODO:
       # Going to need to write more tests for this to make sure it works in more scenarios... but for now this is the desired behavior... despite how terrible this code looks.
       case get_transition_associated_with_event(from_state, %{ "event" => event }) do
