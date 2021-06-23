@@ -614,4 +614,39 @@ defmodule MeditativeTest do
     assert state_before_transition === "#meditative.a"
     assert state_after_transition === "#meditative.d"
   end
+
+  test "Meditative statecharts support a list of transitions where a transition struct with ONLY an actions key will run, the context is updated, and then the next transition struct in the list will run if the guard passes" do
+    statechart = %{
+      "id" => "meditative",
+      "initial_state" => "a",
+      "context" => %{
+        "count" => 0
+      },
+      "states" => %{
+        "a" => %{
+          "on" => %{
+            "DO_IT" => [
+              %{ "actions" => "increment" },
+              %{ "target" => "b", "guard" => "is_count_not_zero?" }
+            ]
+          }
+        },
+        "b" => %{ "type" => "final" }
+      }
+    }
+
+    actions = %{
+      "increment" => fn (%{"count" => count}, event) -> {nil, %{"count" => count + 1}} end
+    }
+
+    guards = %{
+      "is_count_not_zero?" => fn %{"count" => count} -> count !== 0 end
+    }
+
+    machine = Meditative.interpret(statechart, %{"actions" => actions, "guards" => guards, "invoke_sources" => nil})
+    updated_machine = Meditative.transition(machine, "DO_IT")
+
+    assert updated_machine |> Map.get(:context) |> Map.get("count") === 1
+    assert updated_machine |> Map.get(:current_state) === "#meditative.b"
+  end
 end
